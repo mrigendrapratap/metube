@@ -1328,10 +1328,12 @@ CACHE_TTL = 900
 
 # ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
 
+# ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
+
 @routes.get(config.URL_PREFIX + 'stream')
 async def stream_video_proxy(request):
     """
-    Video ID lekar direct valid Googlevideo MP4 CDN stream par redirect karta hai.
+    Video ID lekar direct playable Googlevideo MP4 CDN link nikal kar 302 redirect karta hai.
     """
     vid_id = request.query.get('v', '').strip()
     if not vid_id:
@@ -1339,12 +1341,20 @@ async def stream_video_proxy(request):
 
     video_url = f"https://www.youtube.com/watch?v={vid_id}"
 
+    # Android client extractor options (bina datacenter ban ke Google CDN link deta hai)
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
+        'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
         'quiet': True,
         'no_warnings': True,
-        'skip_download': True
+        'skip_download': True,
+        'socket_timeout': 8,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'web']
+            }
+        }
     }
+    
     if os.path.exists(COOKIES_PATH):
         ydl_opts['cookiefile'] = COOKIES_PATH
 
@@ -1354,7 +1364,26 @@ async def stream_video_proxy(request):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(video_url, download=False)
-                return info.get('url')
+                if not info:
+                    return None
+                
+                # Direct URL check
+                if info.get('url'):
+                    return info.get('url')
+
+                # Agar URL formats list me ho
+                formats = info.get('formats', [])
+                for f in reversed(formats):
+                    # Progressive MP4 (Audio + Video) prioritize karein
+                    if f.get('ext') == 'mp4' and f.get('acodec') != 'none' and f.get('vcodec') != 'none':
+                        return f.get('url')
+
+                # Fallback to any valid URL
+                for f in reversed(formats):
+                    if f.get('url'):
+                        return f.get('url')
+                        
+                return None
         except Exception as e:
             log.warning(f"Native stream resolution failed for {vid_id}: {e}")
             return None
@@ -1362,9 +1391,10 @@ async def stream_video_proxy(request):
     direct_stream_url = await loop.run_in_executor(None, _resolve)
 
     if not direct_stream_url:
-        raise web.HTTPNotFound(reason="Stream link could not be resolved")
+        # Fallback to Invidious stream URL agar Render IP se extract na ho paye
+        direct_stream_url = f"https://inv.nadeko.net/latest_version?id={vid_id}&itag=22"
 
-    # 302 Redirect to genuine high-speed Google CDN
+    # 302 Redirect to genuine Google CDN stream
     return web.HTTPFound(direct_stream_url)
 
 
