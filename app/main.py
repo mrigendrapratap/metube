@@ -1328,93 +1328,78 @@ CACHE_TTL = 900
 
 # ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
 
-# ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
-
-# ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
-
 @routes.get(config.URL_PREFIX + 'stream')
 async def stream_video_proxy(request):
     """
-    Video ID lekar direct 100% playable Googlevideo MP4 CDN link deta hai.
+    Video ID lekar direct playable CDN link return karta hai.
+    Piped API aur Invidious format streams client-agnostic MP4 serve karte hain.
     """
     vid_id = request.query.get('v', '').strip()
     if not vid_id:
         raise web.HTTPBadRequest(reason="Query parameter 'v' is required")
 
     video_url = f"https://www.youtube.com/watch?v={vid_id}"
+    direct_stream_url = None
 
-    # TV & Web_embedded clients datacenter IPs par captcha bypass karte hain
-    ydl_opts = {
-        'format': 'best[ext=mp4]/best',
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'socket_timeout': 7,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv', 'web_embedded', 'android'],
-                'player_skip': ['webpage', 'configs']
-            }
-        }
-    }
+    # Step A: Piped API mirrors (Ye direct progressive MP4 bina IP lock ke return karte hain)
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://api.piped.privacy.com.de",
+        "https://pipedapi.leptons.xyz"
+    ]
 
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts['cookiefile'] = COOKIES_PATH
-
-    loop = asyncio.get_running_loop()
-
-    def _resolve():
+    for base in piped_instances:
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=False)
-                if not info:
-                    return None
+            req_url = f"{base}/streams/{vid_id}"
+            req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                video_streams = data.get("videoStreams", [])
+                # Progressive MP4 (audio + video included) dhundein
+                for s in video_streams:
+                    if s.get("format") == "MPEG_4" and not s.get("videoOnly", True):
+                        direct_stream_url = s.get("url")
+                        break
+                if direct_stream_url:
+                    break
+        except Exception:
+            continue
 
-                # Check 1: info['url']
-                if info.get('url'):
-                    return info.get('url')
-
-                # Check 2: formats iteration
-                formats = info.get('formats', [])
-                for f in reversed(formats):
-                    if f.get('ext') == 'mp4' and f.get('acodec') != 'none' and f.get('vcodec') != 'none':
-                        return f.get('url')
-                for f in reversed(formats):
-                    if f.get('url'):
-                        return f.get('url')
-                return None
-        except Exception as e:
-            log.warning(f"Native stream resolution attempt failed for {vid_id}: {e}")
-            return None
-
-    direct_stream_url = await loop.run_in_executor(None, _resolve)
-
-    # Agar Render IP par yt-dlp block ho, toh active working video mirrors se live googlevideo URL nikalna:
+    # Step B: yt-dlp local extractor fallback (Android client)
     if not direct_stream_url:
-        active_invidious = [
-            "https://invidious.jing.rocks",
-            "https://yt.artemislena.eu",
-            "https://inv.tux.pizza"
-        ]
-        for base in active_invidious:
+        ydl_opts = {
+            'format': 'best[ext=mp4]/best',
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'socket_timeout': 5,
+            'extractor_args': {'youtube': {'player_client': ['android', 'ios']}}
+        }
+        if os.path.exists(COOKIES_PATH):
+            ydl_opts['cookiefile'] = COOKIES_PATH
+
+        def _resolve_ydl():
             try:
-                meta_url = f"{base}/api/v1/videos/{vid_id}"
-                req = urllib.request.Request(meta_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=4) as resp:
-                    data = json.loads(resp.read().decode('utf-8'))
-                    format_streams = data.get("formatStreams", [])
-                    if format_streams:
-                        # Direct googlevideo/cdn url milti hai
-                        direct_stream_url = format_streams[-1].get("url")
-                        if direct_stream_url:
-                            break
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=False)
+                    if not info:
+                        return None
+                    if info.get('url'):
+                        return info.get('url')
+                    for f in reversed(info.get('formats', [])):
+                        if f.get('ext') == 'mp4' and f.get('acodec') != 'none' and f.get('vcodec') != 'none':
+                            return f.get('url')
+                    return None
             except Exception:
-                continue
+                return None
 
+        loop = asyncio.get_running_loop()
+        direct_stream_url = await loop.run_in_executor(None, _resolve_ydl)
+
+    # Step C: Direct embed stream URL (ExoPlayer can play HLS / web stream)
     if not direct_stream_url:
-        raise web.HTTPNotFound(reason="Stream link could not be resolved from any source")
+        direct_stream_url = f"https://invidious.nerdvpn.de/latest_version?id={vid_id}&itag=18"
 
-    # 302 Redirect to direct Google CDN stream
     return web.HTTPFound(direct_stream_url)
 
 
