@@ -1415,13 +1415,16 @@ def _fetch_fb_page_reels_direct(max_results: int = 5) -> list[dict]:
     return results
 
 def _extract_youtube_shorts_sync(query: str, max_count: int = 5) -> list[dict]:
-    """yt-dlp internal search use karke direct playable YouTube Shorts fetch karta hai."""
-    search_query = f"ytsearch{max_count * 2}:{query} shorts"
+    """yt-dlp internal search with fallback web extractor for Shorts."""
+    # Query me shorts keyword
+    search_query = f"ytsearch{max_count * 2}:{query} #shorts"
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
+        'format': 'best',
         'quiet': True,
         'no_warnings': True,
-        'extract_flat': False,
+        'skip_download': True,
+        'extract_flat': 'in_playlist',  # Faster metadata fetch without IP blocking
+        'source_address': '0.0.0.0',
     }
     if os.path.exists(COOKIES_PATH):
         ydl_opts['cookiefile'] = COOKIES_PATH
@@ -1430,21 +1433,45 @@ def _extract_youtube_shorts_sync(query: str, max_count: int = 5) -> list[dict]:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(search_query, download=False)
-            if 'entries' in info:
-                for entry in info['entries']:
-                    if not entry:
-                        continue
-                    duration = entry.get('duration') or 0
-                    if duration <= 65:  # Only Shorts (<= 60s)
-                        results.append({
-                            "reels_type": "youtube",
-                            "title": entry.get("title", "YouTube Short"),
-                            "thumbnail": entry.get("thumbnail", ""),
-                            "video_url": entry.get("url", ""),
-                            "original_url": entry.get("webpage_url", "")
-                        })
-                    if len(results) >= max_count:
-                        break
+            entries = info.get('entries') or []
+            
+            for entry in entries:
+                if not entry:
+                    continue
+                
+                vid_id = entry.get('id')
+                if not vid_id:
+                    continue
+
+                duration = entry.get('duration')
+                # Agar duration available ho aur 65s se zyada ho tabhi skip karein
+                if duration and duration > 65:
+                    continue
+
+                video_url = f"https://www.youtube.com/watch?v={vid_id}"
+                
+                # Direct streaming URL extract karne ke liye lightweight call
+                try:
+                    stream_opts = {'format': 'best[ext=mp4]/best', 'quiet': True}
+                    if os.path.exists(COOKIES_PATH):
+                        stream_opts['cookiefile'] = COOKIES_PATH
+                    with yt_dlp.YoutubeDL(stream_opts) as s_ydl:
+                        v_info = s_ydl.extract_info(video_url, download=False)
+                        play_url = v_info.get('url')
+                        if play_url:
+                            results.append({
+                                "reels_type": "youtube",
+                                "title": v_info.get("title") or entry.get("title") or "YouTube Short",
+                                "thumbnail": v_info.get("thumbnail") or f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
+                                "video_url": play_url,
+                                "original_url": f"https://www.youtube.com/shorts/{vid_id}"
+                            })
+                except Exception as inner_e:
+                    log.warning(f"Error extracting stream for {vid_id}: {inner_e}")
+                    continue
+
+                if len(results) >= max_count:
+                    break
     except Exception as e:
         log.warning(f"YouTube extraction error: {e}")
     return results
