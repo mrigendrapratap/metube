@@ -1302,7 +1302,16 @@ async def version(request):
         "yt-dlp": yt_dlp_version,
         "version": os.getenv("METUBE_VERSION", "dev")
     })
-    
+
+if config.URL_PREFIX != '/':
+    @routes.get('/')
+    async def index_redirect_root(request):
+        return web.HTTPFound(config.URL_PREFIX)
+
+    @routes.get(config.URL_PREFIX[:-1])
+    async def index_redirect_dir(request):
+        return web.HTTPFound(config.URL_PREFIX)
+
 # =====================================================================
 # --- ROBUST MULTI-PLATFORM REELS & SHORTS API (FB, YT, IG) ---
 # =====================================================================
@@ -1440,15 +1449,6 @@ async def search_fb_reels(request):
             results.append(data)
             
     return web.json_response(results)
-
-if config.URL_PREFIX != '/':
-    @routes.get('/')
-    async def index_redirect_root(request):
-        return web.HTTPFound(config.URL_PREFIX)
-
-    @routes.get(config.URL_PREFIX[:-1])
-    async def index_redirect_dir(request):
-        return web.HTTPFound(config.URL_PREFIX)
 
 routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
 routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
