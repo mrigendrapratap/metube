@@ -1,0 +1,654 @@
+"""HTTP handler tests for ``main`` using mocked ``web.Request`` (no TestServer)."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import quote
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+import main
+
+
+@pytest.fixture
+def mock_dqueue(monkeypatch):
+    d = MagicMock()
+    d.initialize = AsyncMock(return_value=None)
+    d.add = AsyncMock(return_value={"status": "ok"})
+    d.retry = AsyncMock(return_value={"status": "ok"})
+    d.cancel = AsyncMock(return_value={"status": "ok"})
+    d.clear = AsyncMock(return_value={"status": "ok"})
+    d.start_pending = AsyncMock(return_value={"status": "ok"})
+    d.cancel_add = MagicMock()
+    d.queue = MagicMock()
+    d.done = MagicMock()
+    d.pending = MagicMock()
+    d.queue.saved_items = MagicMock(return_value=[])
+    d.done.saved_items = MagicMock(return_value=[])
+    d.pending.saved_items = MagicMock(return_value=[])
+    d.queue.items = MagicMock(return_value=[])
+    d.done.items = MagicMock(return_value=[])
+    d.pending.items = MagicMock(return_value=[])
+    d.get = MagicMock(return_value=([], []))
+    monkeypatch.setattr(main, "dqueue", d)
+    return d
+
+
+def _valid_video_add_body(**kwargs):
+    base = {
+        "url": "https://example.com/watch?v=1",
+        "download_type": "video",
+        "codec": "auto",
+        "format": "any",
+        "quality": "best",
+        "ytdl_options_presets": [],
+        "ytdl_options_overrides": "",
+    }
+    base.update(kwargs)
+    return base
+
+
+def _json_request(body: dict | None):
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(return_value=body)
+    return req
+
+
+@pytest.mark.asyncio
+async def test_add_ok(mock_dqueue):
+    req = _json_request(_valid_video_add_body())
+    resp = await main.add(req)
+    assert resp.status == 200
+    text = resp.text
+    data = json.loads(text)
+    assert data["status"] == "ok"
+    mock_dqueue.add.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_retry_passes_failed_download_id(mock_dqueue):
+    req = _json_request({"id": "https://example.com/watch?v=1"})
+    resp = await main.retry(req)
+    assert resp.status == 200
+    mock_dqueue.retry.assert_awaited_once_with("https://example.com/watch?v=1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"id": ""}, {"id": ["a"]}, {"ids": ["a"]}])
+async def test_retry_rejects_missing_or_non_string_id(mock_dqueue, body):
+    with pytest.raises(web.HTTPBadRequest):
+        await main.retry(_json_request(body))
+    mock_dqueue.retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_add_passes_preset_and_overrides(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.config, "YTDL_OPTIONS_PRESETS", {"Preset A": {"writesubtitles": True}})
+    monkeypatch.setattr(main.config, "ALLOW_YTDL_OPTIONS_OVERRIDES", True)
+    req = _json_request(
+        _valid_video_add_body(
+            ytdl_options_presets=["Preset A"],
+            ytdl_options_overrides='{"writesubtitles": true}',
+        )
+    )
+    resp = await main.add(req)
+    assert resp.status == 200
+    call = mock_dqueue.add.await_args
+    assert call is not None
+    assert call.args[13] == ["Preset A"]
+    assert call.args[14] == {"writesubtitles": True}
+
+
+@pytest.mark.asyncio
+async def test_add_legacy_string_preset_normalized(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.config, "YTDL_OPTIONS_PRESETS", {"Legacy": {}})
+    body = _valid_video_add_body()
+    del body["ytdl_options_presets"]
+    body["ytdl_options_preset"] = "Legacy"
+    req = _json_request(body)
+    resp = await main.add(req)
+    assert resp.status == 200
+    call = mock_dqueue.add.await_args
+    assert call.args[13] == ["Legacy"]
+
+
+@pytest.mark.asyncio
+async def test_add_missing_url_returns_400(mock_dqueue):
+    req = _json_request({"download_type": "video", "quality": "best", "format": "any"})
+    with pytest.raises(web.HTTPBadRequest):
+        await main.add(req)
+    mock_dqueue.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_add_invalid_download_type(mock_dqueue):
+    req = _json_request(_valid_video_add_body(download_type="invalid"))
+    with pytest.raises(web.HTTPBadRequest):
+        await main.add(req)
+
+
+@pytest.mark.asyncio
+async def test_add_invalid_video_quality(mock_dqueue):
+    req = _json_request(_valid_video_add_body(quality="9999"))
+    with pytest.raises(web.HTTPBadRequest):
+        await main.add(req)
+
+
+@pytest.mark.asyncio
+async def test_add_invalid_subtitle_language(mock_dqueue):
+    req = _json_request(
+        {
+            "url": "https://example.com/v",
+            "download_type": "captions",
+            "codec": "auto",
+            "format": "srt",
+            "quality": "best",
+            "subtitle_language": "bad language!",
+        }
+    )
+    with pytest.raises(web.HTTPBadRequest):
+        await main.add(req)
+
+
+@pytest.mark.asyncio
+async def test_add_invalid_json_body(mock_dqueue):
+    req = MagicMock(spec=web.Request)
+    req.json = AsyncMock(side_effect=json.JSONDecodeError("msg", "", 0))
+    with pytest.raises(web.HTTPBadRequest):
+        await main.add(req)
+
+
+@pytest.mark.asyncio
+async def test_add_invalid_ytdl_options_override_json(mock_dqueue):
+    req = _json_request(_valid_video_add_body(ytdl_options_overrides="{bad json}"))
+    with pytest.raises(web.HTTPBadRequest):
+        await main.add(req)
+
+
+@pytest.mark.asyncio
+async def test_add_rejects_ytdl_options_overrides_when_disabled(mock_dqueue):
+    req = _json_request(_valid_video_add_body(ytdl_options_overrides='{"exec": "rm -rf /"}'))
+    with pytest.raises(web.HTTPBadRequest):
+        await main.add(req)
+
+
+@pytest.mark.asyncio
+async def test_add_allows_any_ytdl_options_override_key_when_enabled(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.config, "ALLOW_YTDL_OPTIONS_OVERRIDES", True)
+    req = _json_request(_valid_video_add_body(ytdl_options_overrides='{"exec": "echo hi"}'))
+    resp = await main.add(req)
+    assert resp.status == 200
+    call = mock_dqueue.add.await_args
+    assert call is not None
+    assert call.args[14] == {"exec": "echo hi"}
+
+
+@pytest.mark.asyncio
+async def test_add_unknown_ytdl_preset(mock_dqueue):
+    req = _json_request(_valid_video_add_body(ytdl_options_presets=["Missing"]))
+    with pytest.raises(web.HTTPBadRequest):
+        await main.add(req)
+
+
+@pytest.mark.asyncio
+async def test_delete_missing_ids(mock_dqueue):
+    req = _json_request({"where": "queue"})
+    with pytest.raises(web.HTTPBadRequest):
+        await main.delete(req)
+
+
+@pytest.mark.asyncio
+async def test_delete_queue_calls_cancel(mock_dqueue):
+    req = _json_request({"where": "queue", "ids": ["http://x"]})
+    resp = await main.delete(req)
+    assert resp.status == 200
+    mock_dqueue.cancel.assert_awaited_once_with(["http://x"])
+
+
+@pytest.mark.asyncio
+async def test_start_pending(mock_dqueue):
+    req = _json_request({"ids": ["a"]})
+    resp = await main.start(req)
+    assert resp.status == 200
+    mock_dqueue.start_pending.assert_awaited_once_with(["a"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{}, {"ids": "abc"}, {"ids": []}, {"ids": [1, 2]}])
+async def test_start_rejects_malformed_ids(mock_dqueue, body):
+    req = _json_request(body)
+    with pytest.raises(web.HTTPBadRequest):
+        await main.start(req)
+    mock_dqueue.start_pending.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"where": "queue"},
+        {"where": "queue", "ids": "abc"},
+        {"where": "queue", "ids": []},
+        {"where": "queue", "ids": [1, 2]},
+    ],
+)
+async def test_delete_rejects_malformed_ids(mock_dqueue, body):
+    req = _json_request(body)
+    with pytest.raises(web.HTTPBadRequest):
+        await main.delete(req)
+    mock_dqueue.cancel.assert_not_awaited()
+    mock_dqueue.clear.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_history_shape(mock_dqueue):
+    req = MagicMock(spec=web.Request)
+    resp = await main.history(req)
+    assert resp.status == 200
+    data = json.loads(resp.text)
+    assert set(data.keys()) == {"done", "queue", "pending"}
+
+
+@pytest.mark.asyncio
+async def test_history_reads_in_memory_queues_not_disk_state(mock_dqueue):
+    fake_queue_dl = MagicMock()
+    fake_queue_dl.info = {"id": "q1", "title": "Queued"}
+    fake_done_dl = MagicMock()
+    fake_done_dl.info = {"id": "d1", "title": "Done"}
+    fake_pending_dl = MagicMock()
+    fake_pending_dl.info = {"id": "p1", "title": "Pending"}
+    mock_dqueue.queue.items.return_value = [("q1", fake_queue_dl)]
+    mock_dqueue.done.items.return_value = [("d1", fake_done_dl)]
+    mock_dqueue.pending.items.return_value = [("p1", fake_pending_dl)]
+
+    req = MagicMock(spec=web.Request)
+    resp = await main.history(req)
+    assert resp.status == 200
+    data = json.loads(resp.text)
+    assert [item["id"] for item in data["queue"]] == ["q1"]
+    assert [item["id"] for item in data["done"]] == ["d1"]
+    assert [item["id"] for item in data["pending"]] == ["p1"]
+    mock_dqueue.queue.saved_items.assert_not_called()
+    mock_dqueue.done.saved_items.assert_not_called()
+    mock_dqueue.pending.saved_items.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_version_json(mock_dqueue):
+    req = MagicMock(spec=web.Request)
+    resp = await main.version(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert "yt-dlp" in body and "version" in body
+
+
+@pytest.mark.asyncio
+async def test_presets_endpoint_returns_names(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.config, "YTDL_OPTIONS_PRESETS", {"Preset B": {}, "Preset A": {}})
+    req = MagicMock(spec=web.Request)
+    resp = await main.presets(req)
+    assert resp.status == 200
+    assert json.loads(resp.text) == {"presets": ["Preset A", "Preset B"]}
+
+
+@pytest.mark.asyncio
+async def test_cookie_status(mock_dqueue):
+    req = MagicMock(spec=web.Request)
+    resp = await main.cookie_status(req)
+    assert resp.status == 200
+    data = json.loads(resp.text)
+    assert data.get("status") == "ok"
+    assert "has_cookies" in data
+
+
+@pytest.mark.asyncio
+async def test_options_add_cors(mock_dqueue):
+    req = MagicMock(spec=web.Request)
+    resp = await main.add_cors(req)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_upload_cookies_missing_field(mock_dqueue):
+    req = MagicMock(spec=web.Request)
+    reader = MagicMock()
+    field = MagicMock()
+    field.name = "wrongname"
+    reader.next = AsyncMock(side_effect=[field, None])
+    req.multipart = AsyncMock(return_value=reader)
+    resp = await main.upload_cookies(req)
+    assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_add_legacy_format_migrated(mock_dqueue):
+    req = _json_request({"url": "https://example.com/v", "format": "m4a", "quality": "best"})
+    resp = await main.add(req)
+    assert resp.status == 200
+    call = mock_dqueue.add.await_args
+    assert call is not None
+    assert call.args[1] == "audio"
+
+
+@pytest.mark.asyncio
+async def test_add_passes_clip_bounds_to_queue(mock_dqueue):
+    req = _json_request(
+        _valid_video_add_body(clip_start="2:26", clip_end="3:24"),
+    )
+    resp = await main.add(req)
+    assert resp.status == 200
+    call = mock_dqueue.add.await_args
+    assert call is not None
+    assert call.args[15] == pytest.approx(146.0)
+    assert call.args[16] == pytest.approx(204.0)
+
+
+@pytest.mark.asyncio
+async def test_subscribe_passes_clip_bounds(mock_dqueue, monkeypatch):
+    """Issue #1049: a subscription's options apply to every future download, and
+    clip bounds were the one option carved out of that."""
+    monkeypatch.setattr(main.submgr, "add_subscription", AsyncMock(return_value={"status": "ok"}))
+    req = _json_request(
+        {
+            **_valid_video_add_body(clip_start="2:26", clip_end="3:24"),
+            "check_interval_minutes": 60,
+        }
+    )
+    resp = await main.subscribe(req)
+    assert resp.status == 200
+    kwargs = main.submgr.add_subscription.await_args.kwargs
+    assert kwargs["clip_start"] == pytest.approx(146.0)
+    assert kwargs["clip_end"] == pytest.approx(204.0)
+
+
+@pytest.mark.asyncio
+async def test_subscribe_passes_sponsorblock(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.submgr, "add_subscription", AsyncMock(return_value={"status": "ok"}))
+    req = _json_request(
+        {**_valid_video_add_body(), "check_interval_minutes": 60, "sponsorblock": True}
+    )
+    resp = await main.subscribe(req)
+    assert resp.status == 200
+    assert main.submgr.add_subscription.await_args.kwargs["sponsorblock"] is True
+
+
+@pytest.mark.asyncio
+async def test_subscribe_defaults_sponsorblock_off(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.submgr, "add_subscription", AsyncMock(return_value={"status": "ok"}))
+    req = _json_request({**_valid_video_add_body(), "check_interval_minutes": 60})
+    await main.subscribe(req)
+    assert main.submgr.add_subscription.await_args.kwargs["sponsorblock"] is False
+
+
+@pytest.mark.asyncio
+async def test_subscribe_without_clip_fields_stores_none(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.submgr, "add_subscription", AsyncMock(return_value={"status": "ok"}))
+    req = _json_request({**_valid_video_add_body(), "check_interval_minutes": 60})
+    await main.subscribe(req)
+    kwargs = main.submgr.add_subscription.await_args.kwargs
+    assert kwargs["clip_start"] is None
+    assert kwargs["clip_end"] is None
+
+
+@pytest.mark.asyncio
+async def test_subscribe_ignores_t_param_in_url(mock_dqueue, monkeypatch):
+    """A t= timestamp means "start here" for a one-off download of that video.
+    On a channel or playlist URL it says nothing about the videos it yields, so
+    it must not silently clip every future download."""
+    monkeypatch.setattr(main.submgr, "add_subscription", AsyncMock(return_value={"status": "ok"}))
+    body = _valid_video_add_body()
+    # t= is only honoured on YouTube hosts, so this must be one to exercise it.
+    body["url"] = "https://www.youtube.com/@somechannel?t=90"
+    req = _json_request({**body, "check_interval_minutes": 60})
+    await main.subscribe(req)
+    kwargs = main.submgr.add_subscription.await_args.kwargs
+    assert kwargs["clip_start"] is None
+    assert kwargs["clip_end"] is None
+    # The timestamp is still stripped from the URL that gets stored.
+    assert "t=90" not in main.submgr.add_subscription.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_subscribe_explicit_clip_wins_over_t_param(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.submgr, "add_subscription", AsyncMock(return_value={"status": "ok"}))
+    body = _valid_video_add_body(clip_start="30")
+    body["url"] = "https://www.youtube.com/@somechannel?t=90"
+    req = _json_request({**body, "check_interval_minutes": 60})
+    await main.subscribe(req)
+    kwargs = main.submgr.add_subscription.await_args.kwargs
+    assert kwargs["clip_start"] == pytest.approx(30.0)
+
+
+@pytest.mark.asyncio
+async def test_subscribe_still_rejects_clips_for_non_media(mock_dqueue, monkeypatch):
+    monkeypatch.setattr(main.submgr, "add_subscription", AsyncMock(return_value={"status": "ok"}))
+    body = _valid_video_add_body(clip_start="10")
+    body["download_type"] = "thumbnail"
+    req = _json_request({**body, "check_interval_minutes": 60})
+    with pytest.raises(web.HTTPBadRequest):
+        await main.subscribe(req)
+
+
+@pytest.mark.asyncio
+async def test_subscriptions_update_invalid_enabled_returns_error_not_500(mock_dqueue):
+    req = _json_request({"id": "nonexistent", "enabled": "maybe"})
+    resp = await main.subscriptions_update(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_subscriptions_update_invalid_interval_returns_error_not_500(mock_dqueue):
+    req = _json_request({"id": "nonexistent", "check_interval_minutes": "abc"})
+    resp = await main.subscriptions_update(req)
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_subscriptions_update_accepts_folder(monkeypatch, mock_dqueue):
+    """Issue #1052: folder was absent from the route's accepted fields, so a
+    folder-only update was rejected outright as having nothing to update."""
+    submgr = MagicMock()
+    submgr.update_subscription = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(main, "submgr", submgr)
+
+    req = _json_request({"id": "abc", "folder": "channels/jane"})
+    resp = await main.subscriptions_update(req)
+
+    assert resp.status == 200
+    submgr.update_subscription.assert_awaited_once_with("abc", {"folder": "channels/jane"})
+
+
+@pytest.mark.asyncio
+async def test_subscriptions_update_still_drops_unknown_fields(monkeypatch, mock_dqueue):
+    submgr = MagicMock()
+    submgr.update_subscription = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(main, "submgr", submgr)
+
+    req = _json_request({"id": "abc", "seen_ids": ["x"], "url": "https://evil.example"})
+    with pytest.raises(web.HTTPBadRequest):
+        await main.subscriptions_update(req)
+    submgr.update_subscription.assert_not_awaited()
+
+
+def test_is_within_state_dir_blocks_state_subtree():
+    state_dir = main._STATE_DIR_REAL
+    assert main._is_within_state_dir(state_dir)
+    assert main._is_within_state_dir(os.path.join(state_dir, "cookies.txt"))
+    assert main._is_within_state_dir(os.path.join(state_dir, "queue", "item.json"))
+
+
+def test_is_within_state_dir_allows_sibling_downloads():
+    download_dir = os.path.realpath(main.config.DOWNLOAD_DIR)
+    assert not main._is_within_state_dir(os.path.join(download_dir, "video.mp4"))
+    assert not main._is_within_state_dir("/tmp/unrelated/video.mp4")
+
+
+@pytest.mark.asyncio
+async def test_download_blocks_state_dir_files(monkeypatch):
+    download_dir = Path(main.config.DOWNLOAD_DIR)
+    state_dir = download_dir / ".metube"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "cookies.txt").write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    (download_dir / "video.mp4").write_bytes(b"video")
+    # request.path is already percent-decoded by aiohttp; state_dir_guard must
+    # not decode it a second time, or a filename containing a literal '%'
+    # gets mangled into a false 404.
+    percent_filename = "100% done.mp4"
+    (download_dir / percent_filename).write_bytes(b"percent video")
+
+    monkeypatch.setattr(main.config, "STATE_DIR", str(state_dir))
+    monkeypatch.setattr(main, "_STATE_DIR_REAL", os.path.realpath(str(state_dir)))
+
+    try:
+        async with TestClient(TestServer(main.app)) as client:
+            blocked = await client.get("/download/.metube/cookies.txt")
+            assert blocked.status == 404
+
+            allowed = await client.get("/download/video.mp4")
+            assert allowed.status == 200
+            assert await allowed.read() == b"video"
+
+            percent_resp = await client.get("/download/" + quote(percent_filename))
+            assert percent_resp.status == 200
+            assert await percent_resp.read() == b"percent video"
+    finally:
+        (state_dir / "cookies.txt").unlink(missing_ok=True)
+        (download_dir / "video.mp4").unlink(missing_ok=True)
+        (download_dir / percent_filename).unlink(missing_ok=True)
+        state_dir.rmdir()
+
+# --- CORS (issue #155) -------------------------------------------------------
+#
+# The security property under test: credentials are granted only to an origin
+# the operator named explicitly, and never under the '*' wildcard. Each test
+# builds a fresh Application because main.app binds to the first event loop
+# that runs it; the logic under test lives entirely in main.on_prepare, and the
+# real main.add_cors preflight handler is mounted so the preflight path is the
+# production one.
+
+async def _cors_version(request):
+    return web.Response(text="v")
+
+
+def _cors_app():
+    app = web.Application()
+    app.router.add_route("OPTIONS", "/add", main.add_cors)
+    app.router.add_get("/version", _cors_version)
+    app.on_response_prepare.append(main.on_prepare)
+    return app
+
+
+async def _cors_headers(monkeypatch, origins, origin, path="/add", method="OPTIONS"):
+    monkeypatch.setattr(main, "_cors_origins", origins)
+    async with TestClient(TestServer(_cors_app())) as client:
+        resp = await client.request(
+            method, path,
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,authorization",
+            },
+        )
+        return resp.headers
+
+
+@pytest.mark.asyncio
+async def test_cors_listed_origin_gets_credentials(monkeypatch):
+    h = await _cors_headers(monkeypatch, ["https://www.youtube.com"], "https://www.youtube.com")
+    assert h["Access-Control-Allow-Origin"] == "https://www.youtube.com"
+    assert h["Access-Control-Allow-Credentials"] == "true"
+    assert "Authorization" in h["Access-Control-Allow-Headers"]
+    assert "Origin" in h["Vary"]
+
+
+@pytest.mark.asyncio
+async def test_cors_wildcard_never_grants_credentials(monkeypatch):
+    h = await _cors_headers(monkeypatch, ["*"], "https://evil.example")
+    # The wildcard still reflects the origin, exactly as before...
+    assert h["Access-Control-Allow-Origin"] == "https://evil.example"
+    # ...but must not hand out the user's session, nor let a page attempt
+    # credentials of its own.
+    assert "Access-Control-Allow-Credentials" not in h
+    assert h["Access-Control-Allow-Headers"] == "Content-Type"
+
+
+@pytest.mark.asyncio
+async def test_cors_wildcard_mixed_with_named_origin_still_denies_credentials(monkeypatch):
+    # '*' anywhere in the list disables credentials for everyone in it, so a
+    # stray wildcard cannot silently widen a named grant.
+    h = await _cors_headers(monkeypatch, ["*", "https://www.youtube.com"], "https://www.youtube.com")
+    assert h["Access-Control-Allow-Origin"] == "https://www.youtube.com"
+    assert "Access-Control-Allow-Credentials" not in h
+    assert h["Access-Control-Allow-Headers"] == "Content-Type"
+
+
+@pytest.mark.asyncio
+async def test_cors_unlisted_origin_gets_nothing(monkeypatch):
+    h = await _cors_headers(monkeypatch, ["https://www.youtube.com"], "https://evil.example")
+    assert "Access-Control-Allow-Origin" not in h
+    assert "Access-Control-Allow-Credentials" not in h
+
+
+@pytest.mark.asyncio
+async def test_cors_disabled_by_default(monkeypatch):
+    h = await _cors_headers(monkeypatch, [], "https://www.youtube.com")
+    assert "Access-Control-Allow-Origin" not in h
+    assert "Access-Control-Allow-Credentials" not in h
+
+
+@pytest.mark.asyncio
+async def test_cors_credentials_apply_to_actual_response_not_just_preflight(monkeypatch):
+    # The browser checks Allow-Credentials on the real response too, so a
+    # preflight-only grant would still fail.
+    h = await _cors_headers(
+        monkeypatch, ["https://www.youtube.com"], "https://www.youtube.com",
+        path="/version", method="GET")
+    assert h["Access-Control-Allow-Credentials"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_cors_origin_match_is_exact(monkeypatch):
+    # Substring or suffix matching here would be a bypass.
+    for impostor in (
+        "https://www.youtube.com.evil.example",
+        "https://evilwww.youtube.com",
+        "http://www.youtube.com",
+        "https://www.youtube.com:8443",
+    ):
+        h = await _cors_headers(monkeypatch, ["https://www.youtube.com"], impostor)
+        assert "Access-Control-Allow-Origin" not in h, impostor
+        assert "Access-Control-Allow-Credentials" not in h, impostor
+
+
+@pytest.mark.asyncio
+async def test_cors_null_origin_is_not_trusted(monkeypatch):
+    # Sandboxed iframes and some file:// contexts send Origin: null.
+    h = await _cors_headers(monkeypatch, ["https://www.youtube.com"], "null")
+    assert "Access-Control-Allow-Origin" not in h
+    assert "Access-Control-Allow-Credentials" not in h
+
+
+@pytest.mark.asyncio
+async def test_cors_vary_appends_to_existing_value(monkeypatch):
+    # Static responses can already carry a Vary; clobbering it would break
+    # content negotiation.
+    monkeypatch.setattr(main, "_cors_origins", ["https://www.youtube.com"])
+
+    async def handler(request):
+        return web.Response(text="x", headers={"Vary": "Accept-Encoding"})
+
+    app = web.Application()
+    app.router.add_get("/v", handler)
+    app.on_response_prepare.append(main.on_prepare)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/v", headers={"Origin": "https://www.youtube.com"})
+        assert resp.headers["Vary"] == "Accept-Encoding, Origin"
