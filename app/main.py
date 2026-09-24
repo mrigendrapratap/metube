@@ -1322,7 +1322,9 @@ if config.URL_PREFIX != '/':
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
-# ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
+# In-Memory Cache (Quota 429 bachane ke liye 15-minute TTL)
+REELS_CACHE = {}
+CACHE_TTL = 900
 
 # ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
 
@@ -1369,99 +1371,101 @@ async def stream_video_proxy(request):
 # ----------------- 2. CORE REELS EXTRACTOR ENGINE -----------------
 
 def _fetch_youtube_shorts_api(query: str, max_count: int = 5, platform_label: str = "youtube") -> list[dict]:
-    """YouTube Data API v3 se short videos fetch karke native /stream link assign karta hai."""
-    if not YOUTUBE_API_KEY:
-        log.error("YOUTUBE_API_KEY environment variable is not set!")
-        return []
-
-    params = {
-        'part': 'snippet',
-        'q': f"{query} #shorts",
-        'type': 'video',
-        'videoDuration': 'short',
-        'maxResults': max_count,
-        'key': YOUTUBE_API_KEY
-    }
-    api_url = f"https://www.googleapis.com/youtube/v3/search?{urllib.parse.urlencode(params)}"
     results = []
 
-    try:
-        req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as response:
-            payload = json.loads(response.read().decode('utf-8'))
-            items = payload.get('items', [])
+    # Step 1: Official YouTube Data API v3 (Fastest metadata)
+    if YOUTUBE_API_KEY:
+        params = {
+            'part': 'snippet',
+            'q': f"{query} #shorts",
+            'type': 'video',
+            'videoDuration': 'short',
+            'maxResults': max_count,
+            'key': YOUTUBE_API_KEY
+        }
+        api_url = f"https://www.googleapis.com/youtube/v3/search?{urllib.parse.urlencode(params)}"
+        try:
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+                for item in payload.get('items', []):
+                    vid_id = item.get('id', {}).get('videoId')
+                    if not vid_id:
+                        continue
+                    snippet = item.get('snippet', {})
+                    title = snippet.get('title', f'{platform_label.capitalize()} Reel').replace("#shorts", "").replace("#Shorts", "").strip()
+                    thumbnails = snippet.get('thumbnails', {})
+                    thumb_url = thumbnails.get('high', {}).get('url') or thumbnails.get('default', {}).get('url', '')
 
-            for item in items:
-                vid_id = item.get('id', {}).get('videoId')
-                if not vid_id:
-                    continue
+                    results.append({
+                        "reels_type": platform_label,
+                        "title": title,
+                        "thumbnail": thumb_url,
+                        "video_url": f"https://metube-bgiv.onrender.com/stream?v={vid_id}",
+                        "original_url": f"https://www.youtube.com/shorts/{vid_id}"
+                    })
+                if results:
+                    return results
+        except Exception as e:
+            log.warning(f"YouTube Official API failed or quota exceeded ({e}), switching to fallback...")
 
-                snippet = item.get('snippet', {})
-                raw_title = snippet.get('title', f'{platform_label.capitalize()} Reel')
-                clean_title = raw_title.replace("#shorts", "").replace("#Shorts", "").strip()
-
-                thumbnails = snippet.get('thumbnails', {})
-                thumb_url = thumbnails.get('high', {}).get('url') or thumbnails.get('default', {}).get('url', '')
-
-                # Pointing to internal /stream proxy
-                stream_url = f"https://metube-bgiv.onrender.com{config.URL_PREFIX}stream?v={vid_id}"
-
-                results.append({
-                    "reels_type": platform_label,
-                    "title": clean_title,
-                    "thumbnail": thumb_url,
-                    "video_url": stream_url,
-                    "original_url": f"https://www.youtube.com/shorts/{vid_id}"
-                })
-    except Exception as e:
-        log.error(f"Reels API request failed for {platform_label}: {e}")
+    # Step 2: Reliable Active Public Mirrors (Agar 429 quota exceed ho jaye)
+    fallback_instances = [
+        "https://invidious.jing.rocks",
+        "https://yt.artemislena.eu",
+        "https://inv.tux.pizza"
+    ]
+    clean_q = urllib.parse.quote(f"{query} shorts")
+    for base_url in fallback_instances:
+        try:
+            inv_url = f"{base_url}/api/v1/search?q={clean_q}&type=video"
+            req = urllib.request.Request(inv_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=4) as response:
+                items = json.loads(response.read().decode('utf-8'))
+                for item in items:
+                    if item.get("lengthSeconds", 0) <= 65:
+                        vid_id = item.get("videoId")
+                        if not vid_id:
+                            continue
+                        results.append({
+                            "reels_type": platform_label,
+                            "title": item.get("title", f"{platform_label.capitalize()} Reel"),
+                            "thumbnail": f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
+                            "video_url": f"https://metube-bgiv.onrender.com/stream?v={vid_id}",
+                            "original_url": f"https://www.youtube.com/shorts/{vid_id}"
+                        })
+                    if len(results) >= max_count:
+                        return results
+        except Exception:
+            continue
 
     return results
+
+
+def _get_cached_or_fetch(query: str, max_count: int = 5, platform_label: str = "youtube") -> list[dict]:
+    """Cache layer jo Render hits aur YouTube Quota ko bacha kar rakhta hai."""
+    cache_key = f"{platform_label}:{query}:{max_count}"
+    now = time.time()
+
+    if cache_key in REELS_CACHE:
+        timestamp, cached_data = REELS_CACHE[cache_key]
+        if now - timestamp < CACHE_TTL:
+            return cached_data
+
+    fresh_data = _fetch_youtube_shorts_api(query, max_count, platform_label)
+    if fresh_data:
+        REELS_CACHE[cache_key] = (now, fresh_data)
+    return fresh_data
 
 
 def _fetch_fb_reels_direct(query: str = "reels") -> list[dict]:
     """Facebook reels with fail-safe stream pipeline."""
-    results = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    }
-
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-            'format': 'best[ext=mp4]/best',
-            'socket_timeout': 4,
-            'http_headers': headers
-        }
-        test_url = "https://www.facebook.com/watch/reels/"
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(test_url, download=False)
-            entries = info.get('entries', []) if info else []
-            for entry in entries[:5]:
-                vid_url = entry.get('url')
-                if vid_url:
-                    results.append({
-                        "reels_type": "facebook",
-                        "title": entry.get("title", "Facebook Reel"),
-                        "thumbnail": entry.get("thumbnail", ""),
-                        "video_url": vid_url,
-                        "original_url": entry.get("webpage_url", test_url)
-                    })
-    except Exception as e:
-        log.warning(f"Direct FB extraction skipped/throttled: {e}")
-
-    # Guaranteed non-empty fallback with our stream proxy
-    if not results:
-        results = _fetch_youtube_shorts_api(f"facebook viral reels {query}", 5, "facebook")
-
-    return results
+    return _get_cached_or_fetch(f"facebook viral reels {query}", 5, "facebook")
 
 
 def _fetch_ig_reels_direct(query: str = "reels") -> list[dict]:
     """Instagram reels with verified high-speed stream fallback."""
-    return _fetch_youtube_shorts_api(f"instagram viral reels {query}", 5, "instagram")
+    return _get_cached_or_fetch(f"instagram viral reels {query}", 5, "instagram")
 
 
 # ----------------- 3. REELS & SHORTS ROUTING TABLE -----------------
@@ -1470,7 +1474,7 @@ def _fetch_ig_reels_direct(query: str = "reels") -> list[dict]:
 @routes.get(config.URL_PREFIX + 'youtube/trending')
 async def get_yt_trending(request):
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _fetch_youtube_shorts_api, "trending viral shorts", 5, "youtube")
+    data = await loop.run_in_executor(None, _get_cached_or_fetch, "trending viral shorts", 5, "youtube")
     return web.json_response(data)
 
 @routes.get(config.URL_PREFIX + 'youtube/search')
@@ -1479,7 +1483,7 @@ async def search_yt(request):
     if not q:
         raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _fetch_youtube_shorts_api, q, 5, "youtube")
+    data = await loop.run_in_executor(None, _get_cached_or_fetch, q, 5, "youtube")
     return web.json_response(data)
 
 # --- Facebook Reels ---
