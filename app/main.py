@@ -1330,10 +1330,12 @@ CACHE_TTL = 900
 
 # ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
 
+# ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
+
 @routes.get(config.URL_PREFIX + 'stream')
 async def stream_video_proxy(request):
     """
-    Video ID lekar direct playable Googlevideo MP4 CDN link nikal kar 302 redirect karta hai.
+    Video ID lekar direct 100% playable Googlevideo MP4 CDN link deta hai.
     """
     vid_id = request.query.get('v', '').strip()
     if not vid_id:
@@ -1341,20 +1343,21 @@ async def stream_video_proxy(request):
 
     video_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-    # Android client extractor options (bina datacenter ban ke Google CDN link deta hai)
+    # TV & Web_embedded clients datacenter IPs par captcha bypass karte hain
     ydl_opts = {
-        'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+        'format': 'best[ext=mp4]/best',
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
-        'socket_timeout': 8,
+        'socket_timeout': 7,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'web']
+                'player_client': ['tv', 'web_embedded', 'android'],
+                'player_skip': ['webpage', 'configs']
             }
         }
     }
-    
+
     if os.path.exists(COOKIES_PATH):
         ydl_opts['cookiefile'] = COOKIES_PATH
 
@@ -1366,35 +1369,52 @@ async def stream_video_proxy(request):
                 info = ydl.extract_info(video_url, download=False)
                 if not info:
                     return None
-                
-                # Direct URL check
+
+                # Check 1: info['url']
                 if info.get('url'):
                     return info.get('url')
 
-                # Agar URL formats list me ho
+                # Check 2: formats iteration
                 formats = info.get('formats', [])
                 for f in reversed(formats):
-                    # Progressive MP4 (Audio + Video) prioritize karein
                     if f.get('ext') == 'mp4' and f.get('acodec') != 'none' and f.get('vcodec') != 'none':
                         return f.get('url')
-
-                # Fallback to any valid URL
                 for f in reversed(formats):
                     if f.get('url'):
                         return f.get('url')
-                        
                 return None
         except Exception as e:
-            log.warning(f"Native stream resolution failed for {vid_id}: {e}")
+            log.warning(f"Native stream resolution attempt failed for {vid_id}: {e}")
             return None
 
     direct_stream_url = await loop.run_in_executor(None, _resolve)
 
+    # Agar Render IP par yt-dlp block ho, toh active working video mirrors se live googlevideo URL nikalna:
     if not direct_stream_url:
-        # Fallback to Invidious stream URL agar Render IP se extract na ho paye
-        direct_stream_url = f"https://inv.nadeko.net/latest_version?id={vid_id}&itag=22"
+        active_invidious = [
+            "https://invidious.jing.rocks",
+            "https://yt.artemislena.eu",
+            "https://inv.tux.pizza"
+        ]
+        for base in active_invidious:
+            try:
+                meta_url = f"{base}/api/v1/videos/{vid_id}"
+                req = urllib.request.Request(meta_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    format_streams = data.get("formatStreams", [])
+                    if format_streams:
+                        # Direct googlevideo/cdn url milti hai
+                        direct_stream_url = format_streams[-1].get("url")
+                        if direct_stream_url:
+                            break
+            except Exception:
+                continue
 
-    # 302 Redirect to genuine Google CDN stream
+    if not direct_stream_url:
+        raise web.HTTPNotFound(reason="Stream link could not be resolved from any source")
+
+    # 302 Redirect to direct Google CDN stream
     return web.HTTPFound(direct_stream_url)
 
 
