@@ -6,24 +6,28 @@ import sys
 import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
+import pathlib
+import ssl
+import socket
+import logging
+import json
+import re
+import time
+import urllib.request
+import urllib.parse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
 from aiohttp import web
 from aiohttp.web import GracefulExit
 from aiohttp.log import access_logger
-import ssl
-import socket
 import socketio
-import logging
-import json
-import pathlib
-import re
-import time
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from watchfiles import DefaultFilter, Change, awatch
+import yt_dlp
+from yt_dlp.version import __version__ as yt_dlp_version
 
 import bg_tasks
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download
 from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, coerce_optional_bool
-from yt_dlp.version import __version__ as yt_dlp_version
 
 log = logging.getLogger('main')
 
@@ -1316,12 +1320,6 @@ if config.URL_PREFIX != '/':
 # --- ROBUST MULTI-PLATFORM REELS & SHORTS API (FB, YT, IG) ---
 # =====================================================================
 
-import urllib.request
-import urllib.parse
-import yt_dlp
-import re
-
-# Popular public FB pages for guaranteed fallback trending reels
 POPULAR_FB_PAGES = [
     "https://www.facebook.com/watch/reels/",
     "https://www.facebook.com/9gag/reels/",
@@ -1358,7 +1356,6 @@ def _fetch_duckduckgo_links(site_domain: str, search_query: str, max_results: in
     """DuckDuckGo Lite interface se search links extract karta hai."""
     clean_query = f"site:{site_domain} {search_query}"
     encoded = urllib.parse.quote_plus(clean_query)
-    # Using lite interface which is much less prone to datacenter blocking
     url = f"https://lite.duckduckgo.com/lite/?q={encoded}"
     
     headers = {
@@ -1371,8 +1368,6 @@ def _fetch_duckduckgo_links(site_domain: str, search_query: str, max_results: in
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as response:
             html = response.read().decode('utf-8', errors='ignore')
-            
-            # Match duckduckgo redirect or direct hrefs
             raw_matches = re.findall(r'href="([^"]+)"', html)
             for raw_link in raw_matches:
                 actual_link = raw_link
@@ -1380,13 +1375,11 @@ def _fetch_duckduckgo_links(site_domain: str, search_query: str, max_results: in
                     actual_link = urllib.parse.unquote(raw_link.split("uddg=")[1].split("&")[0])
                 
                 if site_domain in actual_link:
-                    # Clean tracking params if any
                     clean_url = actual_link.split("?")[0]
                     if clean_url not in links:
                         links.append(clean_url)
-                
-                if len(links) >= max_results:
-                    break
+                        if len(links) >= max_results:
+                            break
     except Exception as e:
         log.warning(f"Error fetching DuckDuckGo links for {site_domain}: {e}")
     return links
@@ -1411,7 +1404,6 @@ def _fetch_fb_page_reels_direct(max_results: int = 5) -> list[dict]:
                 for entry in entries:
                     reel_url = entry.get('url') or entry.get('webpage_url')
                     if reel_url:
-                        # Extract stream for each
                         stream_data = _extract_stream_sync(reel_url, "facebook")
                         if stream_data and stream_data.get("video_url"):
                             results.append(stream_data)
@@ -1422,13 +1414,47 @@ def _fetch_fb_page_reels_direct(max_results: int = 5) -> list[dict]:
             continue
     return results
 
+def _extract_youtube_shorts_sync(query: str, max_count: int = 5) -> list[dict]:
+    """yt-dlp internal search use karke direct playable YouTube Shorts fetch karta hai."""
+    search_query = f"ytsearch{max_count * 2}:{query} shorts"
+    ydl_opts = {
+        'format': 'best[ext=mp4]/best',
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+    }
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts['cookiefile'] = COOKIES_PATH
+
+    results = []
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+            if 'entries' in info:
+                for entry in info['entries']:
+                    if not entry:
+                        continue
+                    duration = entry.get('duration') or 0
+                    if duration <= 65:  # Only Shorts (<= 60s)
+                        results.append({
+                            "reels_type": "youtube",
+                            "title": entry.get("title", "YouTube Short"),
+                            "thumbnail": entry.get("thumbnail", ""),
+                            "video_url": entry.get("url", ""),
+                            "original_url": entry.get("webpage_url", "")
+                        })
+                    if len(results) >= max_count:
+                        break
+    except Exception as e:
+        log.warning(f"YouTube extraction error: {e}")
+    return results
+
 # ----------------- 1. FACEBOOK REELS ENDPOINTS -----------------
 
 @routes.get(config.URL_PREFIX + 'facebook/trending')
 @routes.get(config.URL_PREFIX + 'trending')
 async def get_fb_trending(request):
     loop = asyncio.get_running_loop()
-    # Direct playlist / flat extraction is 100% reliable on Render
     data = await loop.run_in_executor(None, _fetch_fb_page_reels_direct, 5)
     return web.json_response(data)
 
@@ -1438,17 +1464,62 @@ async def search_fb_reels(request):
     q = request.query.get('q', '').strip()
     if not q:
         raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
-    
     loop = asyncio.get_running_loop()
     found_urls = await loop.run_in_executor(None, _fetch_duckduckgo_links, "facebook.com/reel", q, 4)
-    
     results = []
     for url in found_urls:
         data = await loop.run_in_executor(None, _extract_stream_sync, url, "facebook")
         if data and data.get("video_url"):
             results.append(data)
-            
     return web.json_response(results)
+
+# ----------------- 2. YOUTUBE SHORTS ENDPOINTS -----------------
+
+@routes.get(config.URL_PREFIX + 'youtube/trending')
+async def get_yt_trending(request):
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, _extract_youtube_shorts_sync, "trending viral shorts", 5)
+    return web.json_response(data)
+
+@routes.get(config.URL_PREFIX + 'youtube/search')
+async def search_yt(request):
+    q = request.query.get('q', '').strip()
+    if not q:
+        raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, _extract_youtube_shorts_sync, q, 5)
+    return web.json_response(data)
+
+# ----------------- 3. INSTAGRAM REELS ENDPOINTS -----------------
+
+@routes.get(config.URL_PREFIX + 'instagram/trending')
+async def get_ig_trending(request):
+    loop = asyncio.get_running_loop()
+    found_urls = await loop.run_in_executor(None, _fetch_duckduckgo_links, "instagram.com/reel", "viral reels trending", 5)
+    results = []
+    for url in found_urls:
+        data = await loop.run_in_executor(None, _extract_stream_sync, url, "instagram")
+        if data and data.get("video_url"):
+            results.append(data)
+    return web.json_response(results)
+
+@routes.get(config.URL_PREFIX + 'instagram/search')
+async def search_ig(request):
+    q = request.query.get('q', '').strip()
+    if not q:
+        raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
+    loop = asyncio.get_running_loop()
+    found_urls = await loop.run_in_executor(None, _fetch_duckduckgo_links, "instagram.com/reel", q, 4)
+    results = []
+    for url in found_urls:
+        data = await loop.run_in_executor(None, _extract_stream_sync, url, "instagram")
+        if data and data.get("video_url"):
+            results.append(data)
+    return web.json_response(results)
+
+# =====================================================================
+# --- END REELS & SHORTS API ---
+# =====================================================================
 
 routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
 routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
