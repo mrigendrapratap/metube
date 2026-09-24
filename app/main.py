@@ -1326,13 +1326,10 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
 # ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
 
-stream_path = (config.URL_PREFIX.rstrip('/') + '/stream') if config.URL_PREFIX != '/' else '/stream'
-
-@routes.get(stream_path)
+@routes.get(config.URL_PREFIX + 'stream')
 async def stream_video_proxy(request):
     """
     Video ID lekar direct valid Googlevideo MP4 CDN stream par redirect karta hai.
-    ExoPlayer, Media3 aur browsers is 302 redirect ko seamlessly play karte hain.
     """
     vid_id = request.query.get('v', '').strip()
     if not vid_id:
@@ -1407,7 +1404,7 @@ def _fetch_youtube_shorts_api(query: str, max_count: int = 5, platform_label: st
                 thumb_url = thumbnails.get('high', {}).get('url') or thumbnails.get('default', {}).get('url', '')
 
                 # Pointing to internal /stream proxy
-                stream_url = f"https://metube-bgiv.onrender.com/stream?v={vid_id}"
+                stream_url = f"https://metube-bgiv.onrender.com{config.URL_PREFIX}stream?v={vid_id}"
 
                 results.append({
                     "reels_type": platform_label,
