@@ -1373,7 +1373,7 @@ async def stream_video_proxy(request):
 def _fetch_youtube_shorts_api(query: str, max_count: int = 5, platform_label: str = "youtube") -> list[dict]:
     results = []
 
-    # Step 1: Official YouTube Data API v3 (Fastest metadata)
+    # Step 1: Official API (agar quota available ho)
     if YOUTUBE_API_KEY:
         params = {
             'part': 'snippet',
@@ -1386,7 +1386,7 @@ def _fetch_youtube_shorts_api(query: str, max_count: int = 5, platform_label: st
         api_url = f"https://www.googleapis.com/youtube/v3/search?{urllib.parse.urlencode(params)}"
         try:
             req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as response:
+            with urllib.request.urlopen(req, timeout=4) as response:
                 payload = json.loads(response.read().decode('utf-8'))
                 for item in payload.get('items', []):
                     vid_id = item.get('id', {}).get('videoId')
@@ -1407,37 +1407,41 @@ def _fetch_youtube_shorts_api(query: str, max_count: int = 5, platform_label: st
                 if results:
                     return results
         except Exception as e:
-            log.warning(f"YouTube Official API failed or quota exceeded ({e}), switching to fallback...")
+            log.warning(f"Google API hit quota/error ({e}), switching to direct ytsearch extractor...")
 
-    # Step 2: Reliable Active Public Mirrors (Agar 429 quota exceed ho jaye)
-    fallback_instances = [
-        "https://invidious.jing.rocks",
-        "https://yt.artemislena.eu",
-        "https://inv.tux.pizza"
-    ]
-    clean_q = urllib.parse.quote(f"{query} shorts")
-    for base_url in fallback_instances:
+    # Step 2: Native yt-dlp Flat Search (Zero API Key, Zero Quota, 100% Reliable)
+    if not results:
+        search_query = f"ytsearch{max_count}:{query} #shorts"
+        ydl_opts = {
+            'extract_flat': True,
+            'skip_download': True,
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 6
+        }
+        if os.path.exists(COOKIES_PATH):
+            ydl_opts['cookiefile'] = COOKIES_PATH
+
         try:
-            inv_url = f"{base_url}/api/v1/search?q={clean_q}&type=video"
-            req = urllib.request.Request(inv_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(req, timeout=4) as response:
-                items = json.loads(response.read().decode('utf-8'))
-                for item in items:
-                    if item.get("lengthSeconds", 0) <= 65:
-                        vid_id = item.get("videoId")
-                        if not vid_id:
-                            continue
-                        results.append({
-                            "reels_type": platform_label,
-                            "title": item.get("title", f"{platform_label.capitalize()} Reel"),
-                            "thumbnail": f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
-                            "video_url": f"https://metube-bgiv.onrender.com/stream?v={vid_id}",
-                            "original_url": f"https://www.youtube.com/shorts/{vid_id}"
-                        })
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(search_query, download=False)
+                entries = info.get('entries', []) if info else []
+                for entry in entries:
+                    vid_id = entry.get('id')
+                    if not vid_id:
+                        continue
+                    title = entry.get('title', f'{platform_label.capitalize()} Reel').replace("#shorts", "").replace("#Shorts", "").strip()
+                    results.append({
+                        "reels_type": platform_label,
+                        "title": title,
+                        "thumbnail": f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
+                        "video_url": f"https://metube-bgiv.onrender.com/stream?v={vid_id}",
+                        "original_url": f"https://www.youtube.com/shorts/{vid_id}"
+                    })
                     if len(results) >= max_count:
-                        return results
-        except Exception:
-            continue
+                        break
+        except Exception as e:
+            log.error(f"ytsearch fallback failed: {e}")
 
     return results
 
