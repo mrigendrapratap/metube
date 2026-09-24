@@ -1324,8 +1324,11 @@ YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 
 # ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
 
-@routes.get(config.URL_PREFIX + 'stream')
-@routes.get('/stream')
+# ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
+
+stream_path = (config.URL_PREFIX.rstrip('/') + '/stream') if config.URL_PREFIX != '/' else '/stream'
+
+@routes.get(stream_path)
 async def stream_video_proxy(request):
     """
     Video ID lekar direct valid Googlevideo MP4 CDN stream par redirect karta hai.
