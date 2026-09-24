@@ -1484,14 +1484,12 @@ async def search_yt(request):
 
 # --- Facebook Reels ---
 @routes.get(config.URL_PREFIX + 'facebook/trending')
-@routes.get(config.URL_PREFIX + 'trending')
 async def get_fb_trending(request):
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(None, _fetch_fb_reels_direct, "trending")
     return web.json_response(data)
 
 @routes.get(config.URL_PREFIX + 'facebook/search')
-@routes.get(config.URL_PREFIX + 'search')
 async def search_fb_reels(request):
     q = request.query.get('q', '').strip()
     if not q:
