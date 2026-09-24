@@ -1302,6 +1302,163 @@ async def version(request):
         "yt-dlp": yt_dlp_version,
         "version": os.getenv("METUBE_VERSION", "dev")
     })
+    
+# =====================================================================
+# --- MULTI-PLATFORM REELS & SHORTS API (FB, YT, IG) ---
+# =====================================================================
+
+import urllib.request
+import urllib.parse
+import yt_dlp
+
+def _extract_stream_sync(media_url: str, reels_type: str = "facebook") -> dict | None:
+    """yt-dlp se bina video download kiye direct playable CDN mp4 URL nikalta hai."""
+    ydl_opts = {
+        'format': 'best[ext=mp4]/best',
+        'quiet': True,
+        'no_warnings': True,
+    }
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts['cookiefile'] = COOKIES_PATH
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(media_url, download=False)
+            return {
+                "reels_type": reels_type,
+                "title": info.get("title") or f"{reels_type.capitalize()} Reel",
+                "thumbnail": info.get("thumbnail") or "",
+                "video_url": info.get("url") or "",
+                "original_url": media_url
+            }
+    except Exception as e:
+        log.warning(f"Failed to extract {media_url}: {e}")
+        return None
+
+def _fetch_duckduckgo_links(site_domain: str, search_query: str, max_results: int = 5) -> list[str]:
+    """DuckDuckGo se public FB/IG reels ke URLs scrape karta hai."""
+    clean_query = f"site:{site_domain} {search_query}"
+    encoded = urllib.parse.quote(clean_query)
+    url = f"https://html.duckduckgo.com/html/?q={encoded}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    )
+    links = []
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            html = response.read().decode('utf-8', errors='ignore')
+            # Extract URLs based on platform target
+            pattern = r'href="([^"]*' + re.escape(site_domain) + r'/[^"]*)"'
+            raw_matches = re.findall(pattern, html)
+            for link in raw_matches:
+                if "uddg=" in link:
+                    clean_url = urllib.parse.unquote(link.split("uddg=")[1].split("&")[0])
+                    if clean_url not in links:
+                        links.append(clean_url)
+                elif link not in links:
+                    links.append(link)
+                if len(links) >= max_results:
+                    break
+    except Exception as e:
+        log.warning(f"Error fetching search results for {site_domain}: {e}")
+    return links
+
+async def _process_scraped_reels(site_domain: str, query_term: str, reels_type: str, max_count: int = 4):
+    loop = asyncio.get_running_loop()
+    found_urls = await loop.run_in_executor(None, _fetch_duckduckgo_links, site_domain, query_term, max_count)
+    results = []
+    for url in found_urls:
+        data = await loop.run_in_executor(None, _extract_stream_sync, url, reels_type)
+        if data and data.get("video_url"):
+            results.append(data)
+    return results
+
+def _extract_youtube_shorts_sync(query: str, max_count: int = 5) -> list[dict]:
+    """yt-dlp internal search use karke direct playable YouTube Shorts fetch karta hai."""
+    search_query = f"ytsearch{max_count * 2}:{query} shorts"
+    ydl_opts = {
+        'format': 'best[ext=mp4]/best',
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+    }
+    if os.path.exists(COOKIES_PATH):
+        ydl_opts['cookiefile'] = COOKIES_PATH
+
+    results = []
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(search_query, download=False)
+            if 'entries' in info:
+                for entry in info['entries']:
+                    if not entry:
+                        continue
+                    duration = entry.get('duration') or 0
+                    if duration <= 65:  # Only Shorts (<= 60s approx)
+                        results.append({
+                            "reels_type": "youtube",
+                            "title": entry.get("title", "YouTube Short"),
+                            "thumbnail": entry.get("thumbnail", ""),
+                            "video_url": entry.get("url", ""),
+                            "original_url": entry.get("webpage_url", "")
+                        })
+                    if len(results) >= max_count:
+                        break
+    except Exception as e:
+        log.warning(f"YouTube extraction error: {e}")
+    return results
+
+# ----------------- 1. FACEBOOK REELS ENDPOINTS -----------------
+
+@routes.get(config.URL_PREFIX + 'facebook/trending')
+@routes.get(config.URL_PREFIX + 'trending')  # Alias for backward compatibility
+async def get_fb_trending(request):
+    data = await _process_scraped_reels("facebook.com/reel", "viral reels trending", "facebook", max_count=5)
+    return web.json_response(data)
+
+@routes.get(config.URL_PREFIX + 'facebook/search')
+@routes.get(config.URL_PREFIX + 'search')  # Alias for backward compatibility
+async def search_fb_reels(request):
+    q = request.query.get('q', '').strip()
+    if not q:
+        raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
+    data = await _process_scraped_reels("facebook.com/reel", q, "facebook", max_count=5)
+    return web.json_response(data)
+
+# ----------------- 2. YOUTUBE SHORTS ENDPOINTS -----------------
+
+@routes.get(config.URL_PREFIX + 'youtube/trending')
+async def get_yt_trending(request):
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, _extract_youtube_shorts_sync, "trending viral shorts", 5)
+    return web.json_response(data)
+
+@routes.get(config.URL_PREFIX + 'youtube/search')
+async def search_yt(request):
+    q = request.query.get('q', '').strip()
+    if not q:
+        raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(None, _extract_youtube_shorts_sync, q, 5)
+    return web.json_response(data)
+
+# ----------------- 3. INSTAGRAM REELS ENDPOINTS -----------------
+
+@routes.get(config.URL_PREFIX + 'instagram/trending')
+async def get_ig_trending(request):
+    data = await _process_scraped_reels("instagram.com/reel", "viral reels trending", "instagram", max_count=5)
+    return web.json_response(data)
+
+@routes.get(config.URL_PREFIX + 'instagram/search')
+async def search_ig(request):
+    q = request.query.get('q', '').strip()
+    if not q:
+        raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
+    data = await _process_scraped_reels("instagram.com/reel", q, "instagram", max_count=5)
+    return web.json_response(data)
+    
+# ----------------- END REELS ENDPOINTS -----------------
 
 if config.URL_PREFIX != '/':
     @routes.get('/')
