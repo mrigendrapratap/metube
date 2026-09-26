@@ -1434,94 +1434,117 @@ async def _get_youtube_streams(
     )
 
 
-@routes.get(
-    config.URL_PREFIX + "stream"
-)
-async def youtube_stream(request):
+@routes.get("/stream")
+async def stream_youtube(request):
+    video_id = request.query.get("v", "").strip()
 
-    video_id = (
-        request.query.get("v")
-        or ""
-    ).strip()
-
-    if not _YOUTUBE_VIDEO_ID_RE.fullmatch(
-        video_id
-    ):
-        raise web.HTTPBadRequest(
-            reason="Invalid YouTube video ID"
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        return web.Response(
+            status=400,
+            text="Invalid YouTube video ID"
         )
 
-    try:
+    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        video_url, audio_url = (
-            await _get_youtube_streams(
-                video_id
+    ydl_options = {
+        "quiet": False,
+        "no_warnings": False,
+        "skip_download": True,
+        "format": (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo+bestaudio"
+        ),
+    }
+
+    try:
+        logging.info(
+            "STREAM: extracting YouTube video %s",
+            video_id
+        )
+
+        with yt_dlp.YoutubeDL(ydl_options) as ydl:
+            info = await asyncio.to_thread(
+                ydl.extract_info,
+                youtube_url,
+                download=False
             )
+
+        if not info:
+            raise RuntimeError("yt-dlp returned no video information")
+
+        logging.info(
+            "STREAM: extracted %s - %s",
+            info.get("id"),
+            info.get("title")
         )
 
-    except Exception as exc:
+        requested_formats = info.get("requested_formats") or []
 
-        log.exception(
-            "YouTube stream extraction failed for %s",
-            video_id,
+        logging.info(
+            "STREAM: requested_formats=%s",
+            len(requested_formats)
         )
 
-        raise web.HTTPBadGateway(
-            reason="Unable to extract YouTube stream"
-        ) from exc
+        video_format = None
+        audio_format = None
 
-    log.info(
-        "YouTube stream ready: %s",
-        video_id,
-    )
+        for fmt in requested_formats:
+            if fmt.get("vcodec") != "none" and fmt.get("url"):
+                video_format = fmt
 
-    timeout = ClientTimeout(
-        total=None,
-        connect=30,
-        sock_connect=30,
-        sock_read=120,
-    )
+            if fmt.get("acodec") != "none" and fmt.get("url"):
+                audio_format = fmt
 
-    ffmpeg_command = [
-        "ffmpeg",
+        if not video_format:
+            raise RuntimeError(
+                "No video-only format was selected"
+            )
 
-        "-hide_banner",
-        "-loglevel",
-        "error",
+        if not audio_format:
+            raise RuntimeError(
+                "No audio-only format was selected"
+            )
 
-        "-i",
-        video_url,
+        video_url = video_format["url"]
+        audio_url = audio_format["url"]
 
-        "-i",
-        audio_url,
+        logging.info(
+            "STREAM: video format=%s %sx%s",
+            video_format.get("format_id"),
+            video_format.get("width"),
+            video_format.get("height")
+        )
 
-        "-map",
-        "0:v:0",
+        logging.info(
+            "STREAM: audio format=%s",
+            audio_format.get("format_id")
+        )
 
-        "-map",
-        "1:a:0",
+        ffmpeg_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
 
-        "-c:v",
-        "copy",
+            "-i", video_url,
+            "-i", audio_url,
 
-        "-c:a",
-        "aac",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
 
-        "-b:a",
-        "128k",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "128k",
 
-        "-movflags",
-        "frag_keyframe+empty_moov",
+            "-movflags", "frag_keyframe+empty_moov",
 
-        "-f",
-        "mp4",
+            "-f", "mp4",
+            "pipe:1",
+        ]
 
-        "pipe:1",
-    ]
-
-    process = None
-
-    try:
+        logging.info(
+            "STREAM: starting FFmpeg for %s",
+            video_id
+        )
 
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_command,
@@ -1538,102 +1561,62 @@ async def youtube_stream(request):
             },
         )
 
-        await response.prepare(
-            request
-        )
+        await response.prepare(request)
 
         try:
-
             while True:
-
-                chunk = await process.stdout.read(
-                    1024 * 1024
-                )
+                chunk = await process.stdout.read(64 * 1024)
 
                 if not chunk:
                     break
 
-                await response.write(
-                    chunk
-                )
+                await response.write(chunk)
 
-        except (
-            ConnectionResetError,
-            asyncio.CancelledError,
-        ):
-
-            log.debug(
-                "Client disconnected while streaming %s",
-                video_id,
+        except (ConnectionResetError, BrokenPipeError):
+            logging.warning(
+                "STREAM: client disconnected for %s",
+                video_id
             )
-
-            if process:
-
-                process.kill()
 
         finally:
+            if process.returncode is None:
+                process.kill()
 
-            if process:
+            await process.wait()
 
-                try:
-                    await process.wait()
-                except Exception:
-                    pass
+            stderr_output = await process.stderr.read()
 
-            try:
-                await response.write_eof()
-            except (
-                ConnectionResetError,
-                RuntimeError,
-            ):
-                pass
+            if stderr_output:
+                logging.error(
+                    "STREAM: FFmpeg stderr for %s:\n%s",
+                    video_id,
+                    stderr_output.decode(
+                        "utf-8",
+                        errors="replace"
+                    )
+                )
 
-        if process.returncode not in (
-            0,
-            None,
-        ):
+        await response.write_eof()
 
-            stderr = await process.stderr.read()
-
-            log.error(
-                "FFmpeg failed for %s: %s",
-                video_id,
-                stderr.decode(
-                    "utf-8",
-                    errors="replace"
-                )[:2000],
-            )
+        logging.info(
+            "STREAM: completed %s, ffmpeg exit=%s",
+            video_id,
+            process.returncode
+        )
 
         return response
 
-    except asyncio.CancelledError:
-
-        if process:
-
-            try:
-                process.kill()
-            except Exception:
-                pass
-
-        raise
-
-    except Exception as exc:
-
-        log.exception(
-            "YouTube stream proxy failed for %s",
+    except Exception as e:
+        logging.exception(
+            "STREAM FAILED for %s: %s",
             video_id,
+            e
         )
 
-        if process:
-
-            try:
-                process.kill()
-            except Exception:
-                pass
-
-        raise web.HTTPBadGateway(
-            reason="YouTube stream proxy failed"
-        ) from exc
+        return web.Response(
+            status=502,
+            text=f"Unable to extract YouTube stream: {e}"
+        )
 
 
 # end youtube stream proxy
