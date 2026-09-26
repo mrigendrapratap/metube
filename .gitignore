@@ -52,3 +52,5 @@ pending*
 
 __pycache__
 .venv
+
+downloads/
