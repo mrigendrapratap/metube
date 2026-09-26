@@ -1341,19 +1341,14 @@ routes.get(
 
 # youtube stream proxy
 
-_YOUTUBE_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
+_YOUTUBE_VIDEO_ID_RE = re.compile(
+    r"^[A-Za-z0-9_-]{11}$"
+)
 
-_STREAM_CACHE_TTL = 300
-_stream_url_cache = {}
 
-
-def _extract_youtube_stream_url(video_id: str):
-    """
-    Extract a progressive video+audio URL from YouTube.
-
-    We deliberately prefer formats containing both video and audio because
-    Android ExoPlayer needs a single playable media URL.
-    """
+def _extract_youtube_streams_sync(
+    video_id: str
+):
 
     youtube_url = (
         f"https://www.youtube.com/watch?v={video_id}"
@@ -1363,11 +1358,9 @@ def _extract_youtube_stream_url(video_id: str):
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-
-        # Prefer MP4 progressive formats containing both video and audio.
         "format": (
-            "best[ext=mp4][vcodec!=none][acodec!=none]"
-            "/best[vcodec!=none][acodec!=none]"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo+bestaudio"
         ),
     }
 
@@ -1380,80 +1373,70 @@ def _extract_youtube_stream_url(video_id: str):
 
         if not info:
             raise RuntimeError(
-                "Could not extract YouTube video"
+                "Unable to extract YouTube information"
             )
 
-        stream_url = info.get("url")
-
-        if not stream_url:
-            formats = info.get("formats") or []
-
-            candidates = [
-                f
-                for f in formats
-                if f.get("url")
-                and f.get("vcodec") not in (None, "none")
-                and f.get("acodec") not in (None, "none")
-            ]
-
-            if not candidates:
-                raise RuntimeError(
-                    "No progressive video/audio format available"
-                )
-
-            candidates.sort(
-                key=lambda f: (
-                    f.get("height") or 0,
-                    f.get("tbr") or 0,
-                ),
-                reverse=True,
-            )
-
-            stream_url = candidates[0].get("url")
-
-        if not stream_url:
-            raise RuntimeError(
-                "YouTube stream URL unavailable"
-            )
-
-        return stream_url
-
-
-async def _get_youtube_stream_url(video_id: str):
-
-    now = time.monotonic()
-
-    cached = _stream_url_cache.get(video_id)
-
-    if cached:
-
-        stream_url, created_at = cached
-
-        if (
-            now - created_at
-        ) < _STREAM_CACHE_TTL:
-
-            return stream_url
-
-        _stream_url_cache.pop(
-            video_id,
-            None,
+        requested_formats = (
+            info.get("requested_formats")
+            or []
         )
 
-    stream_url = await asyncio.to_thread(
-        _extract_youtube_stream_url,
+        video_url = None
+        audio_url = None
+
+        for fmt in requested_formats:
+
+            if not fmt:
+                continue
+
+            url = fmt.get("url")
+
+            if not url:
+                continue
+
+            vcodec = fmt.get("vcodec")
+            acodec = fmt.get("acodec")
+
+            if (
+                vcodec not in (None, "none")
+                and
+                acodec in (None, "none")
+            ):
+                video_url = url
+
+            elif (
+                acodec not in (None, "none")
+                and
+                vcodec in (None, "none")
+            ):
+                audio_url = url
+
+        if not video_url:
+            raise RuntimeError(
+                "YouTube video stream unavailable"
+            )
+
+        if not audio_url:
+            raise RuntimeError(
+                "YouTube audio stream unavailable"
+            )
+
+        return video_url, audio_url
+
+
+async def _get_youtube_streams(
+    video_id: str
+):
+
+    return await asyncio.to_thread(
+        _extract_youtube_streams_sync,
         video_id,
     )
 
-    _stream_url_cache[video_id] = (
-        stream_url,
-        now,
-    )
 
-    return stream_url
-
-
-@routes.get(config.URL_PREFIX + 'stream')
+@routes.get(
+    config.URL_PREFIX + "stream"
+)
 async def youtube_stream(request):
 
     video_id = (
@@ -1470,8 +1453,10 @@ async def youtube_stream(request):
 
     try:
 
-        stream_url = await _get_youtube_stream_url(
-            video_id
+        video_url, audio_url = (
+            await _get_youtube_streams(
+                video_id
+            )
         )
 
     except Exception as exc:
@@ -1485,20 +1470,9 @@ async def youtube_stream(request):
             reason="Unable to extract YouTube stream"
         ) from exc
 
-    range_header = request.headers.get(
-        "Range"
-    )
-
-    headers = {}
-
-    if range_header:
-        headers["Range"] = range_header
-
-    headers["User-Agent"] = (
-        "Mozilla/5.0 "
-        "(Android) "
-        "AppleWebKit/537.36 "
-        "Chrome/120.0 Mobile Safari/537.36"
+    log.info(
+        "YouTube stream ready: %s",
+        video_id,
     )
 
     timeout = ClientTimeout(
@@ -1508,104 +1482,139 @@ async def youtube_stream(request):
         sock_read=120,
     )
 
+    ffmpeg_command = [
+        "ffmpeg",
+
+        "-hide_banner",
+        "-loglevel",
+        "error",
+
+        "-i",
+        video_url,
+
+        "-i",
+        audio_url,
+
+        "-map",
+        "0:v:0",
+
+        "-map",
+        "1:a:0",
+
+        "-c:v",
+        "copy",
+
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        "128k",
+
+        "-movflags",
+        "frag_keyframe+empty_moov",
+
+        "-f",
+        "mp4",
+
+        "pipe:1",
+    ]
+
+    process = None
+
     try:
 
-        async with ClientSession(
-            timeout=timeout
-        ) as session:
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
 
-            async with session.get(
-                stream_url,
-                headers=headers,
-                allow_redirects=True,
-            ) as upstream:
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "video/mp4",
+                "Cache-Control": "no-cache",
+                "Accept-Ranges": "none",
+            },
+        )
 
-                if upstream.status not in (
-                    200,
-                    206,
-                ):
+        await response.prepare(
+            request
+        )
 
-                    body = await upstream.text()
+        try:
 
-                    log.error(
-                        "YouTube stream returned HTTP %s for %s: %s",
-                        upstream.status,
-                        video_id,
-                        body[:500],
-                    )
+            while True:
 
-                    raise web.HTTPBadGateway(
-                        reason=(
-                            f"YouTube stream returned "
-                            f"HTTP {upstream.status}"
-                        )
-                    )
-
-                response_headers = {}
-
-                for header in (
-                    "Content-Type",
-                    "Content-Length",
-                    "Content-Range",
-                    "Accept-Ranges",
-                ):
-
-                    value = upstream.headers.get(
-                        header
-                    )
-
-                    if value:
-                        response_headers[
-                            header
-                        ] = value
-
-                response = web.StreamResponse(
-                    status=upstream.status,
-                    headers=response_headers,
+                chunk = await process.stdout.read(
+                    1024 * 1024
                 )
 
-                await response.prepare(
-                    request
+                if not chunk:
+                    break
+
+                await response.write(
+                    chunk
                 )
+
+        except (
+            ConnectionResetError,
+            asyncio.CancelledError,
+        ):
+
+            log.debug(
+                "Client disconnected while streaming %s",
+                video_id,
+            )
+
+            if process:
+
+                process.kill()
+
+        finally:
+
+            if process:
 
                 try:
+                    await process.wait()
+                except Exception:
+                    pass
 
-                    while True:
+            try:
+                await response.write_eof()
+            except (
+                ConnectionResetError,
+                RuntimeError,
+            ):
+                pass
 
-                        chunk = await upstream.content.read(
-                            1024 * 1024
-                        )
+        if process.returncode not in (
+            0,
+            None,
+        ):
 
-                        if not chunk:
-                            break
+            stderr = await process.stderr.read()
 
-                        await response.write(
-                            chunk
-                        )
+            log.error(
+                "FFmpeg failed for %s: %s",
+                video_id,
+                stderr.decode(
+                    "utf-8",
+                    errors="replace"
+                )[:2000],
+            )
 
-                except (
-                    ConnectionResetError,
-                    asyncio.CancelledError,
-                ):
+        return response
 
-                    log.debug(
-                        "Client disconnected while streaming %s",
-                        video_id,
-                    )
+    except asyncio.CancelledError:
 
-                finally:
+        if process:
 
-                    try:
-                        await response.write_eof()
-                    except (
-                        ConnectionResetError,
-                        RuntimeError,
-                    ):
-                        pass
+            try:
+                process.kill()
+            except Exception:
+                pass
 
-                return response
-
-    except web.HTTPException:
         raise
 
     except Exception as exc:
@@ -1614,6 +1623,13 @@ async def youtube_stream(request):
             "YouTube stream proxy failed for %s",
             video_id,
         )
+
+        if process:
+
+            try:
+                process.kill()
+            except Exception:
+                pass
 
         raise web.HTTPBadGateway(
             reason="YouTube stream proxy failed"
