@@ -1436,25 +1436,30 @@ async def _get_youtube_streams(
     )
 
 
-@routes.get("/stream")
+# ============================================================
+# YOUTUBE STREAM PROXY
+# ============================================================
+
+@routes.get(config.URL_PREFIX + "stream")
 async def stream_youtube(request):
     video_id = request.query.get("v", "").strip()
 
-    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+    if not re.fullmatch(r"^[A-Za-z0-9_-]{11}$", video_id):
         return web.Response(status=400, text="Invalid YouTube video ID")
 
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # Handle cookies if present in deployment
-    cookies_path = "/etc/secrets/cookies.txt"
     ydl_options = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
     }
-    if os.path.exists(cookies_path):
-        ydl_options["cookiefile"] = cookies_path
+
+    # Use writable cookiefile from youtube_api module
+    cookiefile = youtube_api.get_writable_cookiefile()
+    if cookiefile:
+        ydl_options["cookiefile"] = cookiefile
 
     try:
         logging.info("STREAM: extracting metadata for %s", video_id)
@@ -1464,7 +1469,6 @@ async def stream_youtube(request):
         if not info:
             raise RuntimeError("yt-dlp returned no video information")
 
-        # Resolve streams (handles both split formats and pre-merged progressive formats)
         video_url = None
         audio_url = None
         requested_formats = info.get("requested_formats") or []
@@ -1476,14 +1480,12 @@ async def stream_youtube(request):
                 if fmt.get("acodec") != "none" and fmt.get("url"):
                     audio_url = fmt["url"]
 
-        # Fallback to single progressive URL if not separated
         if not video_url:
             video_url = info.get("url")
 
         if not video_url:
             raise RuntimeError("Could not find any playable stream URL")
 
-        # Build FFmpeg command based on available inputs
         if audio_url:
             ffmpeg_command = [
                 "ffmpeg",
@@ -1546,10 +1548,9 @@ async def stream_youtube(request):
                 except ProcessLookupError:
                     pass
 
-            # Safe stdout/stderr drain to prevent pipe buffer deadlocks
             _, stderr_data = await process.communicate()
             if stderr_data:
-                logging.warning("STREAM: FFmpeg error output: %s", stderr_data.decode("utf-8", errors="replace"))
+                logging.warning("STREAM: FFmpeg stderr: %s", stderr_data.decode("utf-8", errors="replace"))
 
             await response.write_eof()
 
