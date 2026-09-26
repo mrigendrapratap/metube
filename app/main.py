@@ -1341,192 +1341,116 @@ routes.get(
     config.URL_PREFIX + "api/youtube/cache/clear"
 )(youtube_api.youtube_clear_cache)
 
-# youtube stream proxy
+# ============================================================
+# YOUTUBE STREAM PROXY
+# 512 MB RENDER OPTIMIZED
+# ============================================================
 
 _YOUTUBE_VIDEO_ID_RE = re.compile(
     r"^[A-Za-z0-9_-]{11}$"
 )
 
+# Only one FFmpeg process at a time.
+# Important for the 512 MB Render instance.
+_YOUTUBE_STREAM_SEMAPHORE = asyncio.Semaphore(1)
 
-def _extract_youtube_streams_sync(
-    video_id: str
-):
+# Temporary files live on disk, not RAM.
+_YOUTUBE_STREAM_TEMP_DIR = "/tmp/metube-youtube-streams"
+
+# Safety limits.
+_YOUTUBE_STREAM_MAX_FILE_SIZE = 80 * 1024 * 1024
+_YOUTUBE_STREAM_TIMEOUT = 120
+
+# Small response chunks keep Python memory usage low.
+_YOUTUBE_STREAM_CHUNK_SIZE = 64 * 1024
+
+
+def _ensure_youtube_stream_temp_dir():
+    os.makedirs(
+        _YOUTUBE_STREAM_TEMP_DIR,
+        mode=0o700,
+        exist_ok=True,
+    )
+
+
+def _youtube_stream_temp_path(video_id):
+    return os.path.join(
+        _YOUTUBE_STREAM_TEMP_DIR,
+        f"{video_id}-{os.getpid()}-{time.time_ns()}.mp4",
+    )
+
+
+def _extract_youtube_streams_sync(video_id):
 
     youtube_url = (
         f"https://www.youtube.com/watch?v={video_id}"
     )
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "format": (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo+bestaudio"
-        ),
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-
-        info = ydl.extract_info(
-            youtube_url,
-            download=False,
-        )
-
-        if not info:
-            raise RuntimeError(
-                "Unable to extract YouTube information"
-            )
-
-        requested_formats = (
-            info.get("requested_formats")
-            or []
-        )
-
-        video_url = None
-        audio_url = None
-
-        for fmt in requested_formats:
-
-            if not fmt:
-                continue
-
-            url = fmt.get("url")
-
-            if not url:
-                continue
-
-            vcodec = fmt.get("vcodec")
-            acodec = fmt.get("acodec")
-
-            if (
-                vcodec not in (None, "none")
-                and
-                acodec in (None, "none")
-            ):
-                video_url = url
-
-            elif (
-                acodec not in (None, "none")
-                and
-                vcodec in (None, "none")
-            ):
-                audio_url = url
-
-        if not video_url:
-            raise RuntimeError(
-                "YouTube video stream unavailable"
-            )
-
-        if not audio_url:
-            raise RuntimeError(
-                "YouTube audio stream unavailable"
-            )
-
-        return video_url, audio_url
-
-
-async def _get_youtube_streams(
-    video_id: str
-):
-
-    return await asyncio.to_thread(
-        _extract_youtube_streams_sync,
-        video_id,
-    )
-
-
-# youtube stream proxy
-#
-# Render 512 MB RAM optimization:
-# - yt-dlp extraction runs in a worker thread.
-# - FFmpeg writes to a temporary file instead of keeping the MP4 stream in RAM.
-# - aiohttp FileResponse serves the completed MP4 and supports HTTP Range requests.
-# - Only one FFmpeg process is allowed at a time to avoid RAM exhaustion.
-# - Temporary files are deleted after the response is finished.
-#
-# This is intentionally kept separate from MeTube's normal download queue.
-
-_YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-
-# Render Free/low-memory instance: do not allow multiple FFmpeg jobs.
-# FFmpeg itself can consume significant memory while muxing.
-_YOUTUBE_STREAM_SEMAPHORE = asyncio.Semaphore(1)
-
-# Keep temporary stream files outside the normal download directory.
-# /tmp is ephemeral on Render and is suitable for temporary runtime files.
-_YOUTUBE_STREAM_TEMP_DIR = os.path.join(
-    config.TEMP_DIR if config.TEMP_DIR else "/tmp",
-    "youtube-streams",
-)
-
-# Safety limits for the low-memory Render instance.
-# A Shorts video normally stays comfortably below this.
-_YOUTUBE_STREAM_MAX_FILE_SIZE = 80 * 1024 * 1024  # 80 MB
-_YOUTUBE_STREAM_TIMEOUT = 120  # seconds
-
-
-def _ensure_youtube_stream_temp_dir():
-    """Create the temporary stream directory if necessary."""
-    os.makedirs(_YOUTUBE_STREAM_TEMP_DIR, mode=0o700, exist_ok=True)
-
-
-def _youtube_stream_temp_path(video_id: str) -> str:
-    """Return a unique temporary MP4 path for a YouTube video."""
-    # video_id is already restricted to the safe YouTube ID character set.
-    unique_name = f"{video_id}-{os.getpid()}-{time.time_ns()}.mp4"
-    return os.path.join(_YOUTUBE_STREAM_TEMP_DIR, unique_name)
-
-
-def _extract_youtube_streams_sync(video_id: str):
-    """
-    Extract direct video/audio URLs using yt-dlp.
-
-    This function intentionally does NOT download the media.
-    It only resolves the temporary signed YouTube URLs.
-    """
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-
+    # Keep the video size reasonable for the 512 MB server.
+    # H.264/MP4 is preferred for Android/ExoPlayer compatibility.
     ydl_options = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "format": (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo+bestaudio"
-            "/best[ext=mp4]"
+            "bestvideo"
+            "[height<=480]"
+            "[ext=mp4]"
+            "[vcodec^=avc1]"
+            "+"
+            "bestaudio"
+            "[ext=m4a]"
+            "/bestvideo"
+            "[height<=480]"
+            "[ext=mp4]"
+            "+"
+            "bestaudio"
+            "/best"
+            "[height<=480]"
+            "[ext=mp4]"
             "/best"
         ),
     }
 
-    # Preserve the cookie handling already used by your running service.
-    cookiefile = youtube_api.get_writable_cookiefile()
+    # Use the existing cookie system.
+    cookiefile = (
+        youtube_api.get_writable_cookiefile()
+    )
 
     if cookiefile:
         ydl_options["cookiefile"] = cookiefile
 
-    log.info(
-        "STREAM: extracting YouTube streams for %s (cookies=%s)",
+    logging.info(
+        "STREAM: extracting YouTube streams for %s "
+        "(cookies=%s)",
         video_id,
         bool(cookiefile),
     )
 
-    with yt_dlp.YoutubeDL(ydl_options) as ydl:
+    with yt_dlp.YoutubeDL(
+        ydl_options
+    ) as ydl:
+
         info = ydl.extract_info(
             youtube_url,
             download=False,
         )
 
     if not info:
-        raise RuntimeError("yt-dlp returned no video information")
+        raise RuntimeError(
+            "yt-dlp returned no video information"
+        )
 
     video_url = None
     audio_url = None
 
-    requested_formats = info.get("requested_formats") or []
+    requested_formats = (
+        info.get("requested_formats")
+        or []
+    )
 
-    # Preferred path: yt-dlp selected separate video + audio streams.
     for fmt in requested_formats:
+
         if not fmt:
             continue
 
@@ -1538,40 +1462,42 @@ def _extract_youtube_streams_sync(video_id: str):
         vcodec = fmt.get("vcodec")
         acodec = fmt.get("acodec")
 
+        # Video-only stream
         if (
             vcodec not in (None, "none")
-            and acodec in (None, "none")
+            and
+            acodec in (None, "none")
         ):
             video_url = url
 
+        # Audio-only stream
         elif (
             acodec not in (None, "none")
-            and vcodec in (None, "none")
+            and
+            vcodec in (None, "none")
         ):
             audio_url = url
 
-    # Fallback: a progressive format may contain both.
+    # Fallback for a progressive format.
     if not video_url:
-        direct_url = info.get("url")
-
-        if direct_url:
-            video_url = direct_url
+        video_url = info.get("url")
 
     if not video_url:
-        raise RuntimeError("YouTube video stream unavailable")
+        raise RuntimeError(
+            "YouTube video stream unavailable"
+        )
 
-    return {
-        "video_url": video_url,
-        "audio_url": audio_url,
-        "title": info.get("title") or video_id,
-        "duration": info.get("duration"),
-    }
+    logging.info(
+        "STREAM: video stream found=%s audio stream found=%s",
+        bool(video_url),
+        bool(audio_url),
+    )
+
+    return video_url, audio_url
 
 
-async def _extract_youtube_streams(video_id: str):
-    """
-    Run yt-dlp outside aiohttp's event loop.
-    """
+async def _extract_youtube_streams(video_id):
+
     return await asyncio.to_thread(
         _extract_youtube_streams_sync,
         video_id,
@@ -1579,170 +1505,223 @@ async def _extract_youtube_streams(video_id: str):
 
 
 async def _run_ffmpeg_to_file(
-    video_url: str,
-    audio_url: str | None,
-    output_path: str,
+    video_url,
+    audio_url,
+    output_path,
 ):
-    """
-    Mux YouTube video/audio into a fragmented MP4 file.
-
-    The output goes directly to disk, not through Python memory.
-    This is important for Render's 512 MB RAM instance.
-    """
 
     if audio_url:
+
         ffmpeg_command = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel", "error",
+            "-loglevel",
+            "error",
 
-            # Video input.
-            "-i", video_url,
+            "-i",
+            video_url,
 
-            # Audio input.
-            "-i", audio_url,
+            "-i",
+            audio_url,
 
-            "-map", "0:v:0",
-            "-map", "1:a:0",
+            "-map",
+            "0:v:0",
 
-            # Copy H.264 video whenever possible.
-            # No video re-encoding = much lower CPU/RAM usage.
-            "-c:v", "copy",
+            "-map",
+            "1:a:0",
 
-            # Normalize audio to AAC for broad Android/ExoPlayer support.
-            "-c:a", "aac",
-            "-b:a", "128k",
+            # Copy H.264 video.
+            "-c:v",
+            "copy",
 
-            # Fragmented MP4 allows playback while the file is being produced
-            # and is compatible with Media3/ExoPlayer.
+            # Small AAC audio track.
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "96k",
+
+            # Normal MP4 suitable for ExoPlayer.
             "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
+            "+faststart",
 
-            "-f", "mp4",
+            "-f",
+            "mp4",
 
-            # Direct-to-disk output.
             output_path,
         ]
+
     else:
-        # Progressive stream fallback.
+
         ffmpeg_command = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel", "error",
+            "-loglevel",
+            "error",
 
-            "-i", video_url,
+            "-i",
+            video_url,
 
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "128k",
+            "-c:v",
+            "copy",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "96k",
 
             "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
+            "+faststart",
 
-            "-f", "mp4",
+            "-f",
+            "mp4",
 
             output_path,
         ]
 
-    log.info(
-        "STREAM: starting FFmpeg for %s -> %s",
+    logging.info(
+        "STREAM: starting FFmpeg for %s",
         output_path,
-        os.path.basename(output_path),
     )
 
     process = await asyncio.create_subprocess_exec(
         *ffmpeg_command,
+
         stdout=asyncio.subprocess.DEVNULL,
+
         stderr=asyncio.subprocess.PIPE,
     )
 
     try:
-        stderr_data = await asyncio.wait_for(
+
+        _, stderr_data = await asyncio.wait_for(
             process.communicate(),
             timeout=_YOUTUBE_STREAM_TIMEOUT,
         )
+
     except asyncio.TimeoutError:
-        log.error(
-            "STREAM: FFmpeg timeout after %s seconds",
-            _YOUTUBE_STREAM_TIMEOUT,
+
+        logging.error(
+            "STREAM: FFmpeg timeout for %s",
+            output_path,
         )
 
         if process.returncode is None:
+
             try:
                 process.kill()
+
             except ProcessLookupError:
                 pass
 
         await process.communicate()
 
         raise RuntimeError(
-            f"FFmpeg timed out after {_YOUTUBE_STREAM_TIMEOUT} seconds"
+            "FFmpeg timed out after "
+            f"{_YOUTUBE_STREAM_TIMEOUT} seconds"
         )
 
-    stderr = stderr_data[1] if stderr_data else b""
-
     if process.returncode != 0:
-        error_text = stderr.decode(
-            "utf-8",
-            errors="replace",
-        ).strip()
+
+        error_text = (
+            stderr_data
+            .decode(
+                "utf-8",
+                errors="replace",
+            )
+            .strip()
+        )
 
         raise RuntimeError(
-            f"FFmpeg failed with exit code "
+            "FFmpeg failed with exit code "
             f"{process.returncode}: "
             f"{error_text[-2000:]}"
         )
 
     if not os.path.exists(output_path):
+
         raise RuntimeError(
-            "FFmpeg completed but output file was not created"
+            "FFmpeg completed but output "
+            "file was not created"
         )
 
-    file_size = os.path.getsize(output_path)
-
-    log.info(
-        "STREAM: FFmpeg completed, output=%s bytes",
-        file_size,
+    file_size = os.path.getsize(
+        output_path
     )
 
     if file_size <= 0:
+
         raise RuntimeError(
             "FFmpeg created an empty output file"
         )
 
     if file_size > _YOUTUBE_STREAM_MAX_FILE_SIZE:
+
         try:
             os.remove(output_path)
+
         except OSError:
             pass
 
         raise RuntimeError(
-            "Generated stream is larger than the "
-            f"{_YOUTUBE_STREAM_MAX_FILE_SIZE // (1024 * 1024)} MB limit"
+            "Generated stream exceeds "
+            "80 MB limit"
         )
+
+    logging.info(
+        "STREAM: FFmpeg completed, output=%s bytes",
+        file_size,
+    )
 
     return file_size
 
 
-@routes.get(config.URL_PREFIX + "stream")
+async def _cleanup_youtube_stream_file(
+    file_path,
+    delay=120,
+):
+
+    try:
+
+        await asyncio.sleep(delay)
+
+        if os.path.exists(file_path):
+
+            os.remove(file_path)
+
+            logging.info(
+                "STREAM CLEANUP: removed %s",
+                os.path.basename(file_path),
+            )
+
+    except asyncio.CancelledError:
+
+        raise
+
+    except OSError as exc:
+
+        logging.warning(
+            "STREAM CLEANUP failed: %s",
+            exc,
+        )
+
+
+@routes.get(
+    config.URL_PREFIX + "stream"
+)
 async def stream_youtube(request):
-    """
-    YouTube -> yt-dlp -> FFmpeg -> temporary MP4 -> ExoPlayer.
 
-    Designed for a 512 MB Render instance.
+    video_id = (
+        request.query
+        .get("v", "")
+        .strip()
+    )
 
-    Important:
-    We intentionally generate the MP4 on disk first and then return
-    aiohttp.FileResponse instead of piping FFmpeg stdout through RAM.
-
-    This makes the endpoint much friendlier to Android Media3/ExoPlayer,
-    which may send Range requests and expects a normal HTTP media resource.
-    """
-
-    video_id = request.query.get("v", "").strip()
-
-    log.info(
-        "STREAM REQUEST: method=%s path=%s video_id=%s range=%s user_agent=%s",
+    logging.info(
+        "STREAM REQUEST: "
+        "method=%s path=%s video_id=%s "
+        "range=%s user_agent=%s",
         request.method,
         request.path,
         video_id,
@@ -1750,131 +1729,273 @@ async def stream_youtube(request):
         request.headers.get("User-Agent"),
     )
 
-    if not _YOUTUBE_VIDEO_ID_RE.fullmatch(video_id):
+    # --------------------------------------------------------
+    # Validate YouTube ID
+    # --------------------------------------------------------
+
+    if not _YOUTUBE_VIDEO_ID_RE.fullmatch(
+        video_id
+    ):
+
         return web.Response(
             status=400,
             text="Invalid YouTube video ID",
         )
 
-    output_path = None
+    # --------------------------------------------------------
+    # Only one FFmpeg generation at a time
+    # --------------------------------------------------------
 
-    # Only one yt-dlp + FFmpeg stream at a time.
-    # This is critical for the 512 MB Render instance.
     try:
+
         await asyncio.wait_for(
             _YOUTUBE_STREAM_SEMAPHORE.acquire(),
             timeout=30,
         )
+
     except asyncio.TimeoutError:
-        log.warning(
-            "STREAM BUSY: another YouTube stream is already being generated"
+
+        logging.warning(
+            "STREAM BUSY: another YouTube "
+            "stream is already being generated"
         )
 
         return web.Response(
             status=503,
-            text="YouTube stream server is busy. Please retry.",
+            text=(
+                "YouTube stream server is busy. "
+                "Please retry."
+            ),
             headers={
                 "Retry-After": "5",
             },
         )
 
+    output_path = None
+
     try:
+
         _ensure_youtube_stream_temp_dir()
 
-        stream_info = await _extract_youtube_streams(
+        # ----------------------------------------------------
+        # Extract signed YouTube URLs
+        # ----------------------------------------------------
+
+        (
+            video_url,
+            audio_url,
+        ) = await _extract_youtube_streams(
             video_id
         )
 
-        video_url = stream_info["video_url"]
-        audio_url = stream_info["audio_url"]
+        # ----------------------------------------------------
+        # Generate temporary MP4 on disk
+        # ----------------------------------------------------
 
-        output_path = _youtube_stream_temp_path(
-            video_id
+        output_path = (
+            _youtube_stream_temp_path(
+                video_id
+            )
         )
 
-        await _run_ffmpeg_to_file(
-            video_url=video_url,
-            audio_url=audio_url,
-            output_path=output_path,
+        file_size = (
+            await _run_ffmpeg_to_file(
+                video_url,
+                audio_url,
+                output_path,
+            )
         )
 
-        file_size = os.path.getsize(output_path)
-
-        log.info(
-            "STREAM READY: video_id=%s size=%s bytes",
+        logging.info(
+            "STREAM READY: "
+            "video_id=%s size=%s bytes",
             video_id,
             file_size,
         )
 
-        # FileResponse provides a normal HTTP file response and handles
-        # Range requests much better than StreamResponse.
-        response = web.FileResponse(
-            path=output_path,
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Do NOT use aiohttp.FileResponse here.
+        #
+        # FileResponse was causing:
+        #
+        # AssertionError:
+        # web_fileresponse.py
+        # assert writer is not None
+        #
+        # Stream the file manually in small chunks instead.
+        # ----------------------------------------------------
+
+        response = web.StreamResponse(
+            status=200,
             headers={
                 "Content-Type": "video/mp4",
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Access-Control-Allow-Origin": "*",
-                "Accept-Ranges": "bytes",
+
+                "Content-Length": str(
+                    file_size
+                ),
+
+                "Cache-Control":
+                    "no-cache, no-store, "
+                    "must-revalidate",
+
+                "Pragma":
+                    "no-cache",
+
+                "Accept-Ranges":
+                    "none",
+
+                "Access-Control-Allow-Origin":
+                    "*",
             },
         )
 
-        # FileResponse opens/serves the file asynchronously.
-        # The cleanup is registered after response preparation below.
         await response.prepare(request)
 
-        # aiohttp will continue sending the file after prepare().
-        # We must NOT delete the file here because the response still needs it.
+        # ----------------------------------------------------
+        # Release semaphore before sending the file.
         #
-        # Instead, use a background cleanup task after the response completes.
-        async def _cleanup_stream_file():
-            # Give aiohttp enough time to finish the current transfer.
-            # This task is deliberately lightweight.
-            await asyncio.sleep(5)
+        # FFmpeg has already completed, so another request
+        # can generate its file while this one is being sent.
+        #
+        # However, because the generated MP4 is on disk,
+        # this does not consume a large amount of RAM.
+        # ----------------------------------------------------
 
-            try:
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                    log.info(
-                        "STREAM CLEANUP: removed %s",
-                        os.path.basename(output_path),
+        _YOUTUBE_STREAM_SEMAPHORE.release()
+
+        semaphore_released = True
+
+        try:
+
+            with open(
+                output_path,
+                "rb",
+            ) as stream_file:
+
+                while True:
+
+                    chunk = (
+                        await asyncio.to_thread(
+                            stream_file.read,
+                            _YOUTUBE_STREAM_CHUNK_SIZE,
+                        )
                     )
-            except OSError as exc:
-                log.warning(
-                    "STREAM CLEANUP failed for %s: %s",
-                    output_path,
-                    exc,
-                )
 
-        # Schedule cleanup without holding RAM.
-        bg_tasks.create_task(
-            _cleanup_stream_file(),
-            name=f"cleanup_youtube_stream_{video_id}",
-        )
+                    if not chunk:
+                        break
+
+                    await response.write(
+                        chunk
+                    )
+
+            await response.write_eof()
+
+            logging.info(
+                "STREAM COMPLETE: video_id=%s",
+                video_id,
+            )
+
+        except (
+            ConnectionResetError,
+            BrokenPipeError,
+            asyncio.CancelledError,
+        ):
+
+            logging.info(
+                "STREAM CLIENT DISCONNECTED: "
+                "video_id=%s",
+                video_id,
+            )
+
+            raise
+
+        finally:
+
+            # Give aiohttp enough time to finish the
+            # response before deleting the file.
+            asyncio.create_task(
+                _cleanup_youtube_stream_file(
+                    output_path,
+                    delay=120,
+                )
+            )
 
         return response
 
+    except (
+        ConnectionResetError,
+        BrokenPipeError,
+        asyncio.CancelledError,
+    ):
+
+        # Client disconnected. Do not return another response.
+        if output_path and os.path.exists(
+            output_path
+        ):
+
+            asyncio.create_task(
+                _cleanup_youtube_stream_file(
+                    output_path,
+                    delay=10,
+                )
+            )
+
+        raise
+
     except Exception as exc:
-        log.exception(
+
+        logging.exception(
             "STREAM FAILED for %s: %s",
             video_id,
             exc,
         )
 
-        if output_path and os.path.exists(output_path):
+        if output_path and os.path.exists(
+            output_path
+        ):
+
             try:
-                os.remove(output_path)
+                os.remove(
+                    output_path
+                )
+
             except OSError:
                 pass
 
         return web.Response(
             status=502,
-            text=f"Unable to extract YouTube stream: {exc}",
+            text=(
+                "Unable to extract YouTube "
+                f"stream: {exc}"
+            ),
             content_type="text/plain",
         )
 
     finally:
-        _YOUTUBE_STREAM_SEMAPHORE.release()
+
+        # Release semaphore only if it has not already
+        # been released before streaming the file.
+        #
+        # The local variable is created only after acquire.
+        try:
+
+            if (
+                "_YOUTUBE_STREAM_SEMAPHORE"
+                in globals()
+                and
+                not locals().get(
+                    "semaphore_released",
+                    False,
+                )
+            ):
+
+                _YOUTUBE_STREAM_SEMAPHORE.release()
+
+        except Exception:
+
+            pass
 
 
 # end youtube stream proxy
