@@ -1,37 +1,39 @@
 #!/usr/bin/env python3
 # pylint: disable=no-member,method-hidden
 
-import os
-import sys
+# Standard library
 import asyncio
 from datetime import datetime, timedelta
-from pathlib import Path
-import pathlib
-import ssl
-import socket
-import logging
 import json
+import logging
+import os
+from pathlib import Path
 import re
+import socket
+import ssl
+import sys
 import time
-import urllib.request
-import urllib.parse
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-from aiohttp import web, ClientSession, ClientTimeout
-from aiohttp.web import GracefulExit
+# Third-party libraries
+from aiohttp import ClientSession, ClientTimeout, web
 from aiohttp.log import access_logger
+from aiohttp.web import GracefulExit
 import socketio
-from watchfiles import DefaultFilter, Change, awatch
+from watchfiles import Change, DefaultFilter, awatch
 import yt_dlp
 from yt_dlp.version import __version__ as yt_dlp_version
 
+# Local / Application modules
 import bg_tasks
-
+from subscriptions import (
+    SubscriptionInfo,
+    SubscriptionManager,
+    SubscriptionNotifier,
+    coerce_optional_bool,
+)
 import youtube_api
-
-from ytdl import DownloadQueueNotifier, DownloadQueue, Download
-from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, coerce_optional_bool
-
+from ytdl import Download, DownloadQueue, DownloadQueueNotifier
 
 
 log = logging.getLogger('main')
@@ -1439,121 +1441,79 @@ async def stream_youtube(request):
     video_id = request.query.get("v", "").strip()
 
     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-        return web.Response(
-            status=400,
-            text="Invalid YouTube video ID"
-        )
+        return web.Response(status=400, text="Invalid YouTube video ID")
 
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
+    # Handle cookies if present in deployment
+    cookies_path = "/etc/secrets/cookies.txt"
     ydl_options = {
-        "quiet": False,
-        "no_warnings": False,
+        "quiet": True,
+        "no_warnings": True,
         "skip_download": True,
-          "extractor_args": {
-        "youtube": {
-            "player_client": [
-                "android_vr",
-                "web_safari",
-            ]
-        }
-    },
-        "format": (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo+bestaudio"
-        ),
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
     }
+    if os.path.exists(cookies_path):
+        ydl_options["cookiefile"] = cookies_path
 
     try:
-        logging.info(
-            "STREAM: extracting YouTube video %s",
-            video_id
-        )
-
+        logging.info("STREAM: extracting metadata for %s", video_id)
         with yt_dlp.YoutubeDL(ydl_options) as ydl:
-            info = await asyncio.to_thread(
-                ydl.extract_info,
-                youtube_url,
-                download=False
-            )
+            info = await asyncio.to_thread(ydl.extract_info, youtube_url, download=False)
 
         if not info:
             raise RuntimeError("yt-dlp returned no video information")
 
-        logging.info(
-            "STREAM: extracted %s - %s",
-            info.get("id"),
-            info.get("title")
-        )
-
+        # Resolve streams (handles both split formats and pre-merged progressive formats)
+        video_url = None
+        audio_url = None
         requested_formats = info.get("requested_formats") or []
 
-        logging.info(
-            "STREAM: requested_formats=%s",
-            len(requested_formats)
-        )
+        if requested_formats:
+            for fmt in requested_formats:
+                if fmt.get("vcodec") != "none" and fmt.get("url"):
+                    video_url = fmt["url"]
+                if fmt.get("acodec") != "none" and fmt.get("url"):
+                    audio_url = fmt["url"]
 
-        video_format = None
-        audio_format = None
+        # Fallback to single progressive URL if not separated
+        if not video_url:
+            video_url = info.get("url")
 
-        for fmt in requested_formats:
-            if fmt.get("vcodec") != "none" and fmt.get("url"):
-                video_format = fmt
+        if not video_url:
+            raise RuntimeError("Could not find any playable stream URL")
 
-            if fmt.get("acodec") != "none" and fmt.get("url"):
-                audio_format = fmt
+        # Build FFmpeg command based on available inputs
+        if audio_url:
+            ffmpeg_command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", video_url,
+                "-i", audio_url,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4",
+                "pipe:1",
+            ]
+        else:
+            ffmpeg_command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", video_url,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4",
+                "pipe:1",
+            ]
 
-        if not video_format:
-            raise RuntimeError(
-                "No video-only format was selected"
-            )
-
-        if not audio_format:
-            raise RuntimeError(
-                "No audio-only format was selected"
-            )
-
-        video_url = video_format["url"]
-        audio_url = audio_format["url"]
-
-        logging.info(
-            "STREAM: video format=%s %sx%s",
-            video_format.get("format_id"),
-            video_format.get("width"),
-            video_format.get("height")
-        )
-
-        logging.info(
-            "STREAM: audio format=%s",
-            audio_format.get("format_id")
-        )
-
-        ffmpeg_command = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-
-            "-i", video_url,
-            "-i", audio_url,
-
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "128k",
-
-            "-movflags", "frag_keyframe+empty_moov",
-
-            "-f", "mp4",
-            "pipe:1",
-        ]
-
-        logging.info(
-            "STREAM: starting FFmpeg for %s",
-            video_id
-        )
-
+        logging.info("STREAM: starting FFmpeg process for %s", video_id)
         process = await asyncio.create_subprocess_exec(
             *ffmpeg_command,
             stdout=asyncio.subprocess.PIPE,
@@ -1566,64 +1526,41 @@ async def stream_youtube(request):
                 "Content-Type": "video/mp4",
                 "Cache-Control": "no-cache",
                 "Accept-Ranges": "none",
+                "Access-Control-Allow-Origin": "*",
             },
         )
-
         await response.prepare(request)
 
         try:
             while True:
                 chunk = await process.stdout.read(64 * 1024)
-
                 if not chunk:
                     break
-
                 await response.write(chunk)
-
-        except (ConnectionResetError, BrokenPipeError):
-            logging.warning(
-                "STREAM: client disconnected for %s",
-                video_id
-            )
-
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+            logging.info("STREAM: client disconnected (%s)", video_id)
         finally:
             if process.returncode is None:
-                process.kill()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
 
-            await process.wait()
+            # Safe stdout/stderr drain to prevent pipe buffer deadlocks
+            _, stderr_data = await process.communicate()
+            if stderr_data:
+                logging.warning("STREAM: FFmpeg error output: %s", stderr_data.decode("utf-8", errors="replace"))
 
-            stderr_output = await process.stderr.read()
-
-            if stderr_output:
-                logging.error(
-                    "STREAM: FFmpeg stderr for %s:\n%s",
-                    video_id,
-                    stderr_output.decode(
-                        "utf-8",
-                        errors="replace"
-                    )
-                )
-
-        await response.write_eof()
-
-        logging.info(
-            "STREAM: completed %s, ffmpeg exit=%s",
-            video_id,
-            process.returncode
-        )
+            await response.write_eof()
 
         return response
 
     except Exception as e:
-        logging.exception(
-            "STREAM FAILED for %s: %s",
-            video_id,
-            e
-        )
-
+        logging.exception("STREAM FAILED for %s: %s", video_id, e)
         return web.Response(
             status=502,
-            text=f"Unable to extract YouTube stream: {e}"
+            text=f"Unable to extract YouTube stream: {e}",
+            content_type="text/plain",
         )
 
 
