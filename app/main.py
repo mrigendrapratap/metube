@@ -26,8 +26,13 @@ import yt_dlp
 from yt_dlp.version import __version__ as yt_dlp_version
 
 import bg_tasks
+
+import youtube_api
+
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download
 from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, coerce_optional_bool
+
+
 
 log = logging.getLogger('main')
 
@@ -1316,235 +1321,25 @@ if config.URL_PREFIX != '/':
     async def index_redirect_dir(request):
         return web.HTTPFound(config.URL_PREFIX)
 
-# =====================================================================
-# --- DEDICATED REELS & SHORTS ENGINE (YOUTUBE, FB, INSTAGRAM) ---
-# =====================================================================
+# youtube api
 
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
+routes.get(
+    config.URL_PREFIX + "api/youtube"
+)(youtube_api.youtube_info)
 
-# In-Memory Cache (Quota 429 bachane ke liye 15-minute TTL)
-REELS_CACHE = {}
-CACHE_TTL = 900
+routes.get(
+    config.URL_PREFIX + "api/youtube/popular"
+)(youtube_api.youtube_popular)
 
-# ----------------- 1. NATIVE STREAM RESOLVER PROXY -----------------
+routes.get(
+    config.URL_PREFIX + "api/youtube/search"
+)(youtube_api.youtube_search)
 
-@routes.get(config.URL_PREFIX + 'stream')
-async def stream_video_proxy(request):
-    """
-    Video ID lekar direct 100% playable progressive MP4 link nikal kar 302 redirect karta hai.
-    Zero external mirrors - direct Google Video CDN.
-    """
-    vid_id = request.query.get('v', '').strip()
-    if not vid_id:
-        raise web.HTTPBadRequest(reason="Query parameter 'v' is required")
+routes.get(
+    config.URL_PREFIX + "api/youtube/cache/clear"
+)(youtube_api.youtube_clear_cache)
 
-    video_url = f"https://www.youtube.com/watch?v={vid_id}"
-
-    # iOS / Android profile datacenter IP blocks ko bypass karke direct MP4 link deta hai
-    ydl_opts = {
-        'format': '18/best[ext=mp4]/best',  # itag 18 = 360p/480p progressive MP4 (audio+video saath me)
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'socket_timeout': 10,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['ios', 'android_creator', 'tv_embedded']
-            }
-        }
-    }
-
-    if os.path.exists(COOKIES_PATH):
-        ydl_opts['cookiefile'] = COOKIES_PATH
-
-    loop = asyncio.get_running_loop()
-
-    def _resolve():
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=False)
-                if not info:
-                    return None
-                
-                # Direct format URL
-                if info.get('url'):
-                    return info.get('url')
-
-                # Formats list search for progressive MP4
-                for f in reversed(info.get('formats', [])):
-                    if f.get('ext') == 'mp4' and f.get('acodec') != 'none' and f.get('vcodec') != 'none':
-                        return f.get('url')
-                return None
-        except Exception as e:
-            log.error(f"Stream resolution error for {vid_id}: {e}")
-            return None
-
-    direct_stream_url = await loop.run_in_executor(None, _resolve)
-
-    if not direct_stream_url:
-        raise web.HTTPNotFound(reason="Video stream could not be resolved from source")
-
-    # Direct Google CDN mp4 link par 302 redirect
-    return web.HTTPFound(direct_stream_url)
-
-
-# ----------------- 2. CORE REELS EXTRACTOR ENGINE -----------------
-
-def _fetch_youtube_shorts_api(query: str, max_count: int = 5, platform_label: str = "youtube") -> list[dict]:
-    results = []
-
-    # Step 1: Official API (agar quota available ho)
-    if YOUTUBE_API_KEY:
-        params = {
-            'part': 'snippet',
-            'q': f"{query} #shorts",
-            'type': 'video',
-            'videoDuration': 'short',
-            'maxResults': max_count,
-            'key': YOUTUBE_API_KEY
-        }
-        api_url = f"https://www.googleapis.com/youtube/v3/search?{urllib.parse.urlencode(params)}"
-        try:
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=4) as response:
-                payload = json.loads(response.read().decode('utf-8'))
-                for item in payload.get('items', []):
-                    vid_id = item.get('id', {}).get('videoId')
-                    if not vid_id:
-                        continue
-                    snippet = item.get('snippet', {})
-                    title = snippet.get('title', f'{platform_label.capitalize()} Reel').replace("#shorts", "").replace("#Shorts", "").strip()
-                    thumbnails = snippet.get('thumbnails', {})
-                    thumb_url = thumbnails.get('high', {}).get('url') or thumbnails.get('default', {}).get('url', '')
-
-                    results.append({
-                        "reels_type": platform_label,
-                        "title": title,
-                        "thumbnail": thumb_url,
-                        "video_url": f"https://metube-bgiv.onrender.com/stream?v={vid_id}",
-                        "original_url": f"https://www.youtube.com/shorts/{vid_id}"
-                    })
-                if results:
-                    return results
-        except Exception as e:
-            log.warning(f"Google API hit quota/error ({e}), switching to direct ytsearch extractor...")
-
-    # Step 2: Native yt-dlp Flat Search (Zero API Key, Zero Quota, 100% Reliable)
-    if not results:
-        search_query = f"ytsearch{max_count}:{query} #shorts"
-        ydl_opts = {
-            'extract_flat': True,
-            'skip_download': True,
-            'quiet': True,
-            'no_warnings': True,
-            'socket_timeout': 6
-        }
-        if os.path.exists(COOKIES_PATH):
-            ydl_opts['cookiefile'] = COOKIES_PATH
-
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(search_query, download=False)
-                entries = info.get('entries', []) if info else []
-                for entry in entries:
-                    vid_id = entry.get('id')
-                    if not vid_id:
-                        continue
-                    title = entry.get('title', f'{platform_label.capitalize()} Reel').replace("#shorts", "").replace("#Shorts", "").strip()
-                    results.append({
-                        "reels_type": platform_label,
-                        "title": title,
-                        "thumbnail": f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg",
-                        "video_url": f"https://metube-bgiv.onrender.com/stream?v={vid_id}",
-                        "original_url": f"https://www.youtube.com/shorts/{vid_id}"
-                    })
-                    if len(results) >= max_count:
-                        break
-        except Exception as e:
-            log.error(f"ytsearch fallback failed: {e}")
-
-    return results
-
-
-def _get_cached_or_fetch(query: str, max_count: int = 5, platform_label: str = "youtube") -> list[dict]:
-    """Cache layer jo Render hits aur YouTube Quota ko bacha kar rakhta hai."""
-    cache_key = f"{platform_label}:{query}:{max_count}"
-    now = time.time()
-
-    if cache_key in REELS_CACHE:
-        timestamp, cached_data = REELS_CACHE[cache_key]
-        if now - timestamp < CACHE_TTL:
-            return cached_data
-
-    fresh_data = _fetch_youtube_shorts_api(query, max_count, platform_label)
-    if fresh_data:
-        REELS_CACHE[cache_key] = (now, fresh_data)
-    return fresh_data
-
-
-def _fetch_fb_reels_direct(query: str = "reels") -> list[dict]:
-    """Facebook reels with fail-safe stream pipeline."""
-    return _get_cached_or_fetch(f"facebook viral reels {query}", 5, "facebook")
-
-
-def _fetch_ig_reels_direct(query: str = "reels") -> list[dict]:
-    """Instagram reels with verified high-speed stream fallback."""
-    return _get_cached_or_fetch(f"instagram viral reels {query}", 5, "instagram")
-
-
-# ----------------- 3. REELS & SHORTS ROUTING TABLE -----------------
-
-# --- YouTube Shorts ---
-@routes.get(config.URL_PREFIX + 'youtube/trending')
-async def get_yt_trending(request):
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _get_cached_or_fetch, "trending viral shorts", 5, "youtube")
-    return web.json_response(data)
-
-@routes.get(config.URL_PREFIX + 'youtube/search')
-async def search_yt(request):
-    q = request.query.get('q', '').strip()
-    if not q:
-        raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _get_cached_or_fetch, q, 5, "youtube")
-    return web.json_response(data)
-
-# --- Facebook Reels ---
-@routes.get(config.URL_PREFIX + 'facebook/trending')
-async def get_fb_trending(request):
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _fetch_fb_reels_direct, "trending")
-    return web.json_response(data)
-
-@routes.get(config.URL_PREFIX + 'facebook/search')
-async def search_fb_reels(request):
-    q = request.query.get('q', '').strip()
-    if not q:
-        raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _fetch_fb_reels_direct, q)
-    return web.json_response(data)
-
-# --- Instagram Reels ---
-@routes.get(config.URL_PREFIX + 'instagram/trending')
-async def get_ig_trending(request):
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _fetch_ig_reels_direct, "trending")
-    return web.json_response(data)
-
-@routes.get(config.URL_PREFIX + 'instagram/search')
-async def search_ig(request):
-    q = request.query.get('q', '').strip()
-    if not q:
-        raise web.HTTPBadRequest(reason="Query parameter 'q' is required")
-    loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, _fetch_ig_reels_direct, q)
-    return web.json_response(data)
-
-# =====================================================================
-# --- END REELS ENGINE ---
-# =====================================================================
+# end youtube api
 
 routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
 routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
