@@ -1450,6 +1450,14 @@ async def stream_youtube(request):
         "quiet": False,
         "no_warnings": False,
         "skip_download": True,
+          "extractor_args": {
+        "youtube": {
+            "player_client": [
+                "android_vr",
+                "web_safari",
+            ]
+        }
+    },
         "format": (
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
             "/bestvideo+bestaudio"
