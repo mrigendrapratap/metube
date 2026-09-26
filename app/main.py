@@ -1443,6 +1443,14 @@ async def _get_youtube_streams(
 @routes.get(config.URL_PREFIX + "stream")
 async def stream_youtube(request):
     video_id = request.query.get("v", "").strip()
+    logging.info(
+        "STREAM REQUEST: method=%s path=%s query=%s range=%s user_agent=%s",
+        request.method,
+        request.path,
+        dict(request.query),
+        request.headers.get("Range"),
+        request.headers.get("User-Agent"),
+    )
 
     if not re.fullmatch(r"^[A-Za-z0-9_-]{11}$", video_id):
         return web.Response(status=400, text="Invalid YouTube video ID")
